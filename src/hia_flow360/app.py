@@ -3,13 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from threading import Lock
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .analytics import airport_kpis, compute_snapshots, latest_snapshot_map
 from .fusion import events_to_dataframe
 from .generators import generate_events
+from .models import CameraCreate, CameraUpdate
 from .predictor import forecast
+from . import camera_manager, video_processor, zones_config
 
 app = FastAPI(
     title="HIA Flow360 API",
@@ -204,6 +206,41 @@ _DASHBOARD_STYLE = """
   .medium { background: #f59e0b; }
   .high { background: #ef4444; }
 
+  /* ── Global mode toggle (sidebar) ─────────────── */
+  .sidebar-footer {
+    margin-top: auto;
+    padding-top: 1.1rem;
+    border-top: 1px solid #1f2d48;
+    margin-top: 1.5rem;
+  }
+  .mode-section-label {
+    font-size: 0.72rem;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-bottom: 0.45rem;
+  }
+  .mode-btns-sidebar {
+    display: flex;
+    gap: 0.3rem;
+  }
+  .sbtn {
+    flex: 1;
+    background: transparent;
+    color: #94a3b8;
+    border: 1px solid #2d3f5c;
+    border-radius: 0.4rem;
+    padding: 0.32rem 0.2rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+  .sbtn.active {
+    background: rgba(14,165,233,0.18);
+    color: #38bdf8;
+    border-color: #0ea5e9;
+  }
+
   @media (max-width: 980px) {
     .layout { grid-template-columns: 1fr; }
     .sidebar { position: static; height: auto; }
@@ -219,9 +256,17 @@ def _shell(active: str, title: str, subtitle: str, body: str, page_script: str =
       <nav class="nav">
         <a href="/" {"class='active'" if active == "overview" else ""}>Overview</a>
         <a href="/dashboard/zones" {"class='active'" if active == "zones" else ""}>Zone Analytics</a>
-        <a href="/dashboard/predictions" {"class='active'" if active == "predictions" else ""}>Predictions</a>
+        <a href="/dashboard/predictions" {"class='active'" if active == "predictions" else ""}>Prédictions</a>
+        <a href="/dashboard/map" {"class='active'" if active == "map" else ""}>Carte Interactive</a>
         <a href="/docs">API Docs</a>
       </nav>
+      <div class="sidebar-footer">
+        <div class="mode-section-label">Source de données</div>
+        <div class="mode-btns-sidebar">
+          <button class="sbtn" data-mode="simulated" onclick="setGlobalMode('simulated')">Simulé</button>
+          <button class="sbtn" data-mode="real" onclick="setGlobalMode('real')">Réel</button>
+        </div>
+      </div>
     """
     return f"""
     <!doctype html>
@@ -245,14 +290,31 @@ def _shell(active: str, title: str, subtitle: str, body: str, page_script: str =
                 <h1>{title}</h1>
                 <p class="sub">{subtitle}</p>
               </div>
-              <button class="btn" onclick="refreshData()">Refresh Simulation</button>
+              <button class="btn" id="btnRefresh" onclick="refreshData()">Actualiser</button>
             </div>
             {body}
           </main>
         </div>
         <script>
+          /* ── Global data mode (localStorage) ── */
+          function getGlobalMode() {{
+            return localStorage.getItem('hia_data_mode') || 'simulated';
+          }}
+          function setGlobalMode(m) {{
+            localStorage.setItem('hia_data_mode', m);
+            _syncModeBtns(m);
+            window.dispatchEvent(new CustomEvent('dataModeChange', {{ detail: {{ mode: m }} }}));
+          }}
+          function _syncModeBtns(m) {{
+            document.querySelectorAll('.sbtn').forEach(b =>
+              b.classList.toggle('active', b.dataset.mode === m));
+          }}
+          _syncModeBtns(getGlobalMode());
+
           async function refreshData() {{
-            await fetch('/refresh', {{ method: 'POST' }});
+            if (getGlobalMode() === 'simulated') {{
+              await fetch('/refresh', {{ method: 'POST' }});
+            }}
             location.reload();
           }}
         </script>
@@ -275,6 +337,7 @@ def _rebuild(minutes: int = 120, avg_events_per_minute: int = 40) -> None:
 def _startup() -> None:
     with _lock:
         _rebuild()
+    video_processor.start_all(camera_manager.list_cameras())
 
 
 @app.get("/health")
@@ -286,16 +349,16 @@ def health() -> dict[str, str]:
 def home() -> str:
     body = """
     <section class="grid">
-      <article class="card kpi"><div class="label">Total Occupancy</div><div id="kpi-total" class="value">-</div></article>
-      <article class="card kpi"><div class="label">Avg Congestion</div><div id="kpi-congestion" class="value">-</div></article>
-      <article class="card kpi"><div class="label">Avg Dwell (min)</div><div id="kpi-dwell" class="value">-</div></article>
-      <article class="card kpi"><div class="label">Peak Zone Congestion</div><div id="kpi-peak" class="value">-</div></article>
+      <article class="card kpi"><div class="label" id="kpi1lbl">Occupancy totale</div><div id="kpi1val" class="value">-</div></article>
+      <article class="card kpi"><div class="label" id="kpi2lbl">Congestion moy.</div><div id="kpi2val" class="value">-</div></article>
+      <article class="card kpi"><div class="label" id="kpi3lbl">Dwell moy. (min)</div><div id="kpi3val" class="value">-</div></article>
+      <article class="card kpi"><div class="label" id="kpi4lbl">Congestion pic</div><div id="kpi4val" class="value">-</div></article>
       <article class="card span-8">
-        <h3>Zone Occupancy Snapshot</h3>
+        <h3 id="chart1title">Occupancy par zone</h3>
         <canvas id="occupancyChart"></canvas>
       </article>
       <article class="card span-4">
-        <h3>Congestion Distribution</h3>
+        <h3 id="chart2title">Distribution</h3>
         <canvas id="congestionChart"></canvas>
       </article>
     </section>
@@ -303,45 +366,77 @@ def home() -> str:
     script = """
     <script>
       let occupancyChart, congestionChart;
+      const CHART_COLORS = ['#0369a1','#0ea5e9','#38bdf8','#7dd3fc','#0284c7','#0891b2','#22d3ee'];
+
       async function loadOverview() {
-        const [kpisRes, zonesRes] = await Promise.all([fetch('/kpis'), fetch('/zones/latest')]);
-        const kpisData = await kpisRes.json();
-        const zonesData = await zonesRes.json();
-        const k = kpisData.kpis;
-        document.getElementById('kpi-total').textContent = Math.round(k.total_occupancy);
-        document.getElementById('kpi-congestion').textContent = (k.avg_congestion * 100).toFixed(1) + '%';
-        document.getElementById('kpi-dwell').textContent = k.avg_dwell_minutes.toFixed(2);
-        document.getElementById('kpi-peak').textContent = (k.max_zone_congestion * 100).toFixed(1) + '%';
+        getGlobalMode() === 'simulated' ? await loadSimulated() : await loadReal();
+      }
 
-        const zones = zonesData.zones || [];
-        const labels = zones.map(z => z.zone);
-        const occupancy = zones.map(z => z.occupancy);
-        const congestion = zones.map(z => +(z.congestion_score * 100).toFixed(2));
+      async function loadSimulated() {
+        const [kr, zr] = await Promise.all([fetch('/kpis'), fetch('/zones/latest')]);
+        const kd = await kr.json(); const zd = await zr.json();
+        const k = kd.kpis;
+        setKpis(
+          'Occupancy totale', Math.round(k.total_occupancy),
+          'Congestion moy.', (k.avg_congestion*100).toFixed(1)+'%',
+          'Dwell moy. (min)', k.avg_dwell_minutes.toFixed(2),
+          'Congestion pic', (k.max_zone_congestion*100).toFixed(1)+'%'
+        );
+        const zones = zd.zones || [];
+        renderCharts(
+          zones.map(z => z.zone), zones.map(z => z.occupancy),
+          zones.map(z => +(z.congestion_score*100).toFixed(2)),
+          'Occupancy par zone', 'Répartition congestion'
+        );
+      }
 
+      async function loadReal() {
+        const r = await fetch('/zones/camera-live');
+        const d = await r.json();
+        const zones = d.zones || [];
+        const peak = zones.reduce((a,b) => a.occupancy>b.occupancy?a:b, {zone:'-',occupancy:0});
+        setKpis(
+          'Personnes en mvt.', d.total_persons || 0,
+          'Caméras actives', (d.active_cameras||0)+' / '+(d.total_cameras||0),
+          'Zone la + chargée', peak.zone || '-',
+          'Caméras configurées', d.total_cameras || 0
+        );
+        renderCharts(
+          zones.map(z => z.zone), zones.map(z => z.occupancy), zones.map(z => z.occupancy),
+          'Personnes en mvt. par zone', 'Répartition par zone'
+        );
+      }
+
+      function setKpis(l1,v1,l2,v2,l3,v3,l4,v4) {
+        ['kpi1lbl','kpi2lbl','kpi3lbl','kpi4lbl'].forEach((id,i)=>
+          document.getElementById(id).textContent=[l1,l2,l3,l4][i]);
+        ['kpi1val','kpi2val','kpi3val','kpi4val'].forEach((id,i)=>
+          document.getElementById(id).textContent=[v1,v2,v3,v4][i]);
+      }
+
+      function renderCharts(labels, occupancy, dist, title1, title2) {
+        document.getElementById('chart1title').textContent = title1;
+        document.getElementById('chart2title').textContent = title2;
         if (occupancyChart) occupancyChart.destroy();
         occupancyChart = new Chart(document.getElementById('occupancyChart'), {
           type: 'bar',
-          data: {
-            labels,
-            datasets: [{ label: 'Occupancy', data: occupancy, backgroundColor: '#0ea5e9', borderRadius: 6 }]
-          },
+          data: { labels, datasets: [{ label: 'Personnes', data: occupancy, backgroundColor: '#0ea5e9', borderRadius: 6 }] },
           options: { responsive: true, plugins: { legend: { display: false } } }
         });
-
         if (congestionChart) congestionChart.destroy();
         congestionChart = new Chart(document.getElementById('congestionChart'), {
           type: 'doughnut',
-          data: {
-            labels,
-            datasets: [{ data: congestion, backgroundColor: ['#0369a1','#0ea5e9','#38bdf8','#7dd3fc','#0284c7','#0891b2','#22d3ee'] }]
-          },
+          data: { labels, datasets: [{ data: dist, backgroundColor: CHART_COLORS }] },
           options: { responsive: true }
         });
       }
+
+      window.addEventListener('dataModeChange', () => loadOverview());
       loadOverview();
+      setInterval(loadOverview, 5000);
     </script>
     """
-    return _shell("overview", "Operations Overview", "Live KPIs and airport-wide flow health", body, script)
+    return _shell("overview", "Operations Overview", "Live KPIs — source de données dans la barre latérale", body, script)
 
 
 @app.get("/dashboard/zones", response_class=HTMLResponse)
@@ -349,15 +444,15 @@ def dashboard_zones() -> str:
     body = """
     <section class="grid">
       <article class="card span-8">
-        <h3>Inflow vs Outflow by Zone</h3>
+        <h3 id="flowTitle">Inflow vs Outflow par zone</h3>
         <canvas id="flowChart"></canvas>
       </article>
       <article class="card span-4">
-        <h3>Average Dwell Time by Zone</h3>
+        <h3 id="dwellTitle">Temps de séjour moyen par zone</h3>
         <canvas id="dwellChart"></canvas>
       </article>
       <article class="card span-12">
-        <h3>Latest Zone Table</h3>
+        <h3>Tableau des zones</h3>
         <div style="overflow-x:auto;">
           <table>
             <thead>
@@ -372,75 +467,89 @@ def dashboard_zones() -> str:
     script = """
     <script>
       let flowChart, dwellChart;
+      const DWELL_COLORS = ['#106b9a','#239ccf','#42acdb','#6fb8dd','#1584bf','#1b94b2','#33b9cf'];
+
       async function loadZones() {
-        const zonesRes = await fetch('/zones/latest');
-        const zonesData = await zonesRes.json();
-        const zones = zonesData.zones || [];
+        getGlobalMode() === 'simulated' ? await loadZonesSim() : await loadZonesReal();
+      }
+
+      async function loadZonesSim() {
+        document.getElementById('flowTitle').textContent = 'Inflow vs Outflow par zone';
+        document.getElementById('dwellTitle').textContent = 'Temps de séjour moyen par zone';
+        const r = await fetch('/zones/latest');
+        const d = await r.json();
+        const zones = d.zones || [];
         const labels = zones.map(z => z.zone);
-        const inflow = zones.map(z => z.inflow_per_min);
-        const outflow = zones.map(z => z.outflow_per_min);
-        const dwell = zones.map(z => z.avg_dwell_minutes);
 
         if (flowChart) flowChart.destroy();
         flowChart = new Chart(document.getElementById('flowChart'), {
           type: 'bar',
-          data: {
-            labels,
-            datasets: [
-              { label: 'Inflow/min', data: inflow, backgroundColor: '#10b981', borderRadius: 5 },
-              { label: 'Outflow/min', data: outflow, backgroundColor: '#f97316', borderRadius: 5 }
-            ]
-          },
+          data: { labels, datasets: [
+            { label: 'Inflow/min', data: zones.map(z => z.inflow_per_min), backgroundColor: '#10b981', borderRadius: 5 },
+            { label: 'Outflow/min', data: zones.map(z => z.outflow_per_min), backgroundColor: '#f97316', borderRadius: 5 }
+          ]},
           options: { responsive: true }
         });
 
         if (dwellChart) dwellChart.destroy();
         dwellChart = new Chart(document.getElementById('dwellChart'), {
           type: 'doughnut',
-          data: {
-            labels,
-            datasets: [{
-              label: 'Dwell min',
-              data: dwell,
-              backgroundColor: ['#106b9a','#239ccf','#42acdb','#6fb8dd','#1584bf','#1b94b2','#33b9cf'],
-              borderColor: '#e2e8f0',
-              borderWidth: 2
-            }]
-          },
-          options: {
-            responsive: true,
-            cutout: '48%',
-            plugins: {
-              legend: {
-                display: true,
-                position: 'top',
-                labels: { boxWidth: 18, padding: 14 }
-              }
-            }
-          }
+          data: { labels, datasets: [{ label: 'Dwell min', data: zones.map(z => z.avg_dwell_minutes),
+            backgroundColor: DWELL_COLORS, borderColor: '#e2e8f0', borderWidth: 2 }] },
+          options: { responsive: true, cutout: '48%', plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 18, padding: 14 } } } }
         });
 
-        const tbody = document.getElementById('zones-table');
-        tbody.innerHTML = zones.map(z => `
-          <tr>
-            <td>${z.zone}</td>
-            <td>${z.occupancy}</td>
-            <td>${z.inflow_per_min.toFixed(2)}</td>
-            <td>${z.outflow_per_min.toFixed(2)}</td>
-            <td>${z.avg_dwell_minutes.toFixed(2)}</td>
-            <td>${(z.congestion_score * 100).toFixed(1)}%</td>
-          </tr>
+        document.getElementById('zones-table').innerHTML = zones.map(z => `
+          <tr><td>${z.zone}</td><td>${z.occupancy}</td>
+              <td>${z.inflow_per_min.toFixed(2)}</td><td>${z.outflow_per_min.toFixed(2)}</td>
+              <td>${z.avg_dwell_minutes.toFixed(2)}</td><td>${(z.congestion_score*100).toFixed(1)}%</td></tr>
         `).join('');
       }
+
+      async function loadZonesReal() {
+        document.getElementById('flowTitle').textContent = 'Personnes en mouvement par zone (caméras)';
+        document.getElementById('dwellTitle').textContent = 'Répartition par zone (caméras)';
+        const r = await fetch('/zones/camera-live');
+        const d = await r.json();
+        const zones = d.zones || [];
+        const labels = zones.map(z => z.zone);
+        const counts = zones.map(z => z.occupancy);
+
+        if (flowChart) flowChart.destroy();
+        flowChart = new Chart(document.getElementById('flowChart'), {
+          type: 'bar',
+          data: { labels, datasets: [
+            { label: 'Personnes en mvt.', data: counts, backgroundColor: '#0ea5e9', borderRadius: 5 }
+          ]},
+          options: { responsive: true, plugins: { legend: { display: false } } }
+        });
+
+        if (dwellChart) dwellChart.destroy();
+        dwellChart = new Chart(document.getElementById('dwellChart'), {
+          type: 'doughnut',
+          data: { labels, datasets: [{ data: counts, backgroundColor: DWELL_COLORS, borderColor: '#e2e8f0', borderWidth: 2 }] },
+          options: { responsive: true, cutout: '48%', plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 18, padding: 14 } } } }
+        });
+
+        document.getElementById('zones-table').innerHTML = zones.map(z => `
+          <tr><td>${z.zone}</td><td>${z.occupancy}</td>
+              <td colspan="2" style="color:#475569;font-style:italic">— (données caméra)</td>
+              <td>—</td><td>${z.camera_count} cam.</td></tr>
+        `).join('');
+      }
+
+      window.addEventListener('dataModeChange', () => loadZones());
       loadZones();
     </script>
     """
-    return _shell("zones", "Zone Analytics", "Flow, dwell and congestion patterns by operational area", body, script)
+    return _shell("zones", "Zone Analytics", "Flow et congestion — source de données dans la barre latérale", body, script)
 
 
 @app.get("/dashboard/predictions", response_class=HTMLResponse)
 def dashboard_predictions() -> str:
     body = """
+    <div id="realBanner" style="display:none;background:#0f172a;color:#94a3b8;border-radius:0.6rem;
+         padding:0.55rem 0.9rem;font-size:0.84rem;margin-bottom:0.85rem;"></div>
     <section class="grid">
       <article class="card span-8">
         <h3>Predicted Occupancy (30 min horizon)</h3>
@@ -505,10 +614,30 @@ def dashboard_predictions() -> str:
           </tr>
         `).join('');
       }
-      loadPredictions();
+      async function loadRealBanner() {
+        const r = await fetch('/zones/camera-live');
+        const d = await r.json();
+        const b = document.getElementById('realBanner');
+        b.innerHTML = '<strong>Caméras actives&nbsp;: ' + (d.active_cameras||0) + ' / ' + (d.total_cameras||0) +
+          '</strong> &nbsp;&bull;&nbsp; Personnes en mvt. au total&nbsp;: <strong>' + (d.total_persons||0) +
+          '</strong> &nbsp;&bull;&nbsp; <em>Les prédictions sont toujours basées sur la simulation</em>';
+        b.style.display = '';
+      }
+
+      async function init() {
+        const banner = document.getElementById('realBanner');
+        if (getGlobalMode() === 'real') { await loadRealBanner(); } else { banner.style.display = 'none'; }
+        loadPredictions();
+      }
+
+      window.addEventListener('dataModeChange', e => {
+        const banner = document.getElementById('realBanner');
+        if (e.detail.mode === 'real') loadRealBanner(); else banner.style.display = 'none';
+      });
+      init();
     </script>
     """
-    return _shell("predictions", "Predictive Intelligence", "Near-term congestion and wait risk forecast", body, script)
+    return _shell("predictions", "Predictive Intelligence", "Prévisions de congestion — source de données dans la barre latérale", body, script)
 
 
 @app.post("/refresh")
@@ -555,3 +684,697 @@ def get_predictions(horizon_min: int = 30) -> dict[str, object]:
             "horizon_min": horizon_min,
             "predictions": [p.model_dump() for p in preds],
         }
+
+
+# ---------------------------------------------------------------------------
+# Camera CRUD endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/cameras")
+def list_cameras_api() -> dict[str, object]:
+    cams = camera_manager.list_cameras()
+    for c in cams:
+        c["person_count"] = video_processor.get_count(c["id"])
+    return {"cameras": cams}
+
+
+@app.post("/cameras", status_code=201)
+def create_camera_api(body: CameraCreate) -> dict[str, object]:
+    cam = camera_manager.create_camera(
+        name=body.name,
+        x=body.x,
+        y=body.y,
+        angle=body.angle,
+        zone=body.zone,
+    )
+    video_processor.start_processor(cam["id"], cam["folder"])
+    return cam
+
+
+@app.put("/cameras/{camera_id}")
+def update_camera_api(camera_id: str, body: CameraUpdate) -> dict[str, object]:
+    cam = camera_manager.update_camera(
+        camera_id,
+        name=body.name,
+        x=body.x,
+        y=body.y,
+        angle=body.angle,
+        zone=body.zone,
+    )
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return cam
+
+
+@app.delete("/cameras/{camera_id}")
+def delete_camera_api(camera_id: str) -> dict[str, object]:
+    video_processor.stop_processor(camera_id)
+    ok = camera_manager.delete_camera(camera_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return {"deleted": camera_id}
+
+
+@app.get("/cameras/{camera_id}/stream")
+def stream_camera(camera_id: str):
+    cam = camera_manager.get_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    return StreamingResponse(
+        video_processor.frame_generator(camera_id),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/cameras/{camera_id}/count")
+def camera_count(camera_id: str) -> dict[str, object]:
+    return {"camera_id": camera_id, "person_count": video_processor.get_count(camera_id)}
+
+
+# ---------------------------------------------------------------------------
+# Interactive map dashboard
+# ---------------------------------------------------------------------------
+
+_MAP_STYLE = """
+<style>
+  /* ── Toolbar ─────────────────────────────────────────────── */
+  .map-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.85rem;
+  }
+  .btn-add  { background: #10b981; }
+  .btn-edit { background: #8b5cf6; }
+  .btn-add.active, .btn-edit.active { background: #f59e0b; }
+  .btn-reset { background: #64748b; font-size: 0.82rem; padding: 0.38rem 0.65rem; }
+  .toolbar-sep { width: 1px; height: 24px; background: #dbe2ea; margin: 0 0.2rem; }
+  .hint-text { font-size: 0.82rem; color: #f59e0b; font-weight: 600; display: none; }
+
+  .legend {
+    display: flex;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .legend-item { display: flex; align-items: center; gap: 0.3rem; font-size: 0.76rem; color: #475569; }
+  .legend-dot  { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+
+  /* ── Map layout ──────────────────────────────────────────── */
+  .map-area { display: flex; gap: 1rem; align-items: flex-start; }
+  .canvas-wrap {
+    flex: 1; border: 1px solid #dbe2ea; border-radius: 0.85rem;
+    overflow: hidden; background: #e0e5ea; cursor: default;
+  }
+  #airportMap { display: block; width: 100%; height: auto; }
+
+  /* ── Side panels ─────────────────────────────────────────── */
+  .side-panel {
+    width: 230px; flex-shrink: 0;
+    background: #fff; border: 1px solid #dbe2ea;
+    border-radius: 0.85rem; padding: 1rem; display: none;
+  }
+  .side-panel.visible { display: block; }
+  .side-panel h3 { margin: 0 0 0.6rem; font-size: 0.97rem; }
+  .info-row { font-size: 0.83rem; color: #475569; margin-bottom: 0.35rem; }
+  .info-row strong { color: #0f172a; }
+  .panel-btns { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.75rem; }
+  .panel-btns button { width: 100%; }
+  .btn-danger    { background: #ef4444; }
+  .btn-secondary { background: #475569; }
+  .count-big { font-size: 1.5rem; font-weight: 700; color: #0ea5e9; }
+  .form-group { margin-bottom: 0.7rem; }
+  .form-group label { display: block; font-size: 0.82rem; color: #475569; margin-bottom: 0.25rem; }
+  .form-group input, .form-group select {
+    width: 100%; padding: 0.4rem 0.55rem; border: 1px solid #cbd5e1;
+    border-radius: 0.45rem; font-size: 0.9rem;
+  }
+  .form-group input[type=range]  { padding: 0; }
+  .form-group input[type=color]  { padding: 2px; height: 34px; cursor: pointer; }
+
+  /* ── Modals ──────────────────────────────────────────────── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.45); z-index: 1000;
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal-box {
+    background: #fff; border-radius: 1rem; padding: 1.5rem;
+    width: 360px; max-width: 95vw;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+  }
+  .modal-box.large { width: 740px; }
+  .modal-box h3 { margin: 0 0 1rem; }
+  .modal-footer { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
+  .video-wrap {
+    background: #000; border-radius: 0.6rem; overflow: hidden;
+    text-align: center; min-height: 300px;
+  }
+  .video-wrap img { max-width: 100%; height: auto; }
+  .count-badge {
+    display: inline-block; background: #0ea5e9; color: #fff;
+    border-radius: 999px; padding: 0.2rem 0.75rem;
+    font-weight: 700; font-size: 0.9rem; margin-top: 0.5rem;
+  }
+</style>
+"""
+
+_MAP_BODY = """
+<div class="map-toolbar">
+  <button class="btn btn-add" id="btnAddCam" onclick="toggleMode('addCam')">+ Caméra</button>
+  <button class="btn btn-edit" id="btnEditZones" onclick="toggleMode('editZones')">✏ Zones</button>
+  <div class="toolbar-sep"></div>
+  <button class="btn btn-reset" onclick="confirmResetZones()">Réinitialiser carte</button>
+  <span id="hintText" class="hint-text"></span>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#3B82F6"></div>Enregistrement</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#EF4444"></div>Sécurité</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#8B5CF6"></div>Douane</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#06B6D4"></div>Transit</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#10B981"></div>Boutiques</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#F59E0B"></div>Embarquement</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#F97316"></div>Bagages</div>
+  </div>
+</div>
+<div class="map-area">
+  <div class="canvas-wrap"><canvas id="airportMap" width="1180" height="640"></canvas></div>
+
+  <!-- Camera info panel -->
+  <div id="camPanel" class="side-panel">
+    <h3 id="cpName">Caméra</h3>
+    <div class="info-row">Zone&nbsp;: <strong id="cpZone"></strong></div>
+    <div class="info-row">Orientation&nbsp;: <strong id="cpAngle"></strong></div>
+    <div class="info-row">En mouvement&nbsp;: <span class="count-big" id="cpCount">0</span></div>
+    <div class="panel-btns">
+      <button class="btn" onclick="openVideoModal()">Voir le flux</button>
+      <button class="btn btn-secondary" onclick="openCamEditModal()">Modifier</button>
+      <button class="btn btn-danger" onclick="confirmDeleteCam()">Supprimer</button>
+    </div>
+  </div>
+
+  <!-- Zone edit panel -->
+  <div id="zonePanel" class="side-panel">
+    <h3>Zone sélectionnée</h3>
+    <div class="form-group">
+      <label>Nom</label>
+      <input type="text" id="zpLabel" oninput="onZoneLabelChange()" />
+    </div>
+    <div class="form-group">
+      <label>Type</label>
+      <select id="zpType" onchange="onZoneTypeChange()">
+        <option value="checkin">Enregistrement</option>
+        <option value="security">Sécurité</option>
+        <option value="immigration">Douane / Immigration</option>
+        <option value="transfer">Transit</option>
+        <option value="retail">Boutiques</option>
+        <option value="gate">Embarquement</option>
+        <option value="baggage">Bagages</option>
+        <option value="custom">Personnalisé</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Couleur</label>
+      <input type="color" id="zpColor" oninput="onZoneColorChange()" />
+    </div>
+    <div class="panel-btns">
+      <button class="btn btn-danger" onclick="confirmDeleteZone()">Supprimer ce bloc</button>
+    </div>
+  </div>
+</div>
+
+<!-- Camera add / edit modal -->
+<div class="modal-overlay" id="camModal">
+  <div class="modal-box">
+    <h3 id="camModalTitle">Ajouter une caméra</h3>
+    <div class="form-group"><label>Nom</label>
+      <input type="text" id="cmName" placeholder="ex: Cam Sécurité Nord" /></div>
+    <div class="form-group"><label>Zone</label>
+      <select id="cmZone">
+        <option value="checkin">Enregistrement</option>
+        <option value="security">Sécurité</option>
+        <option value="immigration">Douane / Immigration</option>
+        <option value="transfer">Transit</option>
+        <option value="retail">Boutiques</option>
+        <option value="gate">Embarquement</option>
+        <option value="baggage">Bagages</option>
+      </select></div>
+    <div class="form-group">
+      <label>Orientation&nbsp;: <strong id="cmAngleDisp">0°</strong></label>
+      <input type="range" id="cmAngle" min="0" max="359" value="0"
+             oninput="document.getElementById('cmAngleDisp').textContent=this.value+'°';" /></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeCamModal()">Annuler</button>
+      <button class="btn" onclick="saveCam()">Enregistrer</button>
+    </div>
+  </div>
+</div>
+
+<!-- New zone config modal -->
+<div class="modal-overlay" id="newZoneModal">
+  <div class="modal-box">
+    <h3>Nouveau bloc de zone</h3>
+    <div class="form-group"><label>Nom</label>
+      <input type="text" id="nzLabel" placeholder="ex: Salle VIP" /></div>
+    <div class="form-group"><label>Type</label>
+      <select id="nzType" onchange="onNewZoneTypeChange()">
+        <option value="gate">Embarquement</option>
+        <option value="checkin">Enregistrement</option>
+        <option value="security">Sécurité</option>
+        <option value="immigration">Douane</option>
+        <option value="transfer">Transit</option>
+        <option value="retail">Boutiques</option>
+        <option value="baggage">Bagages</option>
+        <option value="custom">Personnalisé</option>
+      </select></div>
+    <div class="form-group"><label>Couleur</label>
+      <input type="color" id="nzColor" value="#F59E0B" /></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeNewZoneModal()">Annuler</button>
+      <button class="btn" onclick="confirmNewZone()">Créer</button>
+    </div>
+  </div>
+</div>
+
+<!-- Video feed modal -->
+<div class="modal-overlay" id="videoModal">
+  <div class="modal-box large">
+    <h3>Flux caméra&nbsp;: <span id="videoTitle"></span></h3>
+    <div class="video-wrap"><img id="videoStream" src="" alt="Chargement…" /></div>
+    <div style="text-align:center;margin-top:0.5rem">
+      <span class="count-badge">En mouvement&nbsp;: <span id="vCount">0</span></span>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeVideoModal()">Fermer</button>
+    </div>
+  </div>
+</div>
+"""
+
+_MAP_SCRIPT = """
+<script>
+const MAP_W = 1180, MAP_H = 640, HS = 9;
+
+const ZONE_TYPES = {
+  checkin:     {label:'Enregistrement', color:'#3B82F6'},
+  security:    {label:'Sécurité',       color:'#EF4444'},
+  immigration: {label:'Douane',         color:'#8B5CF6'},
+  transfer:    {label:'Transit',        color:'#06B6D4'},
+  retail:      {label:'Boutiques',      color:'#10B981'},
+  gate:        {label:'Embarquement',   color:'#F59E0B'},
+  baggage:     {label:'Bagages',        color:'#F97316'},
+  custom:      {label:'Personnalisé',   color:'#94A3B8'},
+};
+
+// ── State ──────────────────────────────────────────────────────────────────────
+let zones = [], cameras = [];
+let currentMode = 'normal';
+let selectedCam = null, selectedZone = null;
+let dragState = null;
+let pendingCamPos = null, pendingNewZone = null;
+let videoCountInterval = null;
+
+const canvas = document.getElementById('airportMap');
+const ctx = canvas.getContext('2d');
+
+// ── Drawing ────────────────────────────────────────────────────────────────────
+function drawMap() {
+  ctx.clearRect(0, 0, MAP_W, MAP_H);
+  ctx.fillStyle = '#d1d9e0'; ctx.fillRect(0, 0, MAP_W, MAP_H);
+
+  zones.forEach(z => {
+    const sel = currentMode === 'editZones' && selectedZone && selectedZone.id === z.id;
+    ctx.fillStyle = z.color + 'bb';
+    ctx.beginPath(); ctx.roundRect(z.x, z.y, z.w, z.h, 7); ctx.fill();
+    ctx.strokeStyle = sel ? '#0ea5e9' : z.color;
+    ctx.lineWidth = sel ? 3 : 2;
+    ctx.setLineDash(sel ? [6,3] : []);
+    ctx.beginPath(); ctx.roundRect(z.x, z.y, z.w, z.h, 7); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Segoe UI'; ctx.textAlign = 'center';
+    wrapText(z.label, z.x + z.w/2, z.y + z.h/2, z.w - 14, 17);
+  });
+
+  if (currentMode === 'editZones' && selectedZone) {
+    getHandles(selectedZone).forEach(h => {
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 1.5;
+      ctx.fillRect(h.x-HS/2, h.y-HS/2, HS, HS);
+      ctx.strokeRect(h.x-HS/2, h.y-HS/2, HS, HS);
+    });
+  }
+
+  if (dragState && dragState.type === 'draw') {
+    const {startX:sx, startY:sy, currX:cx, currY:cy} = dragState;
+    const [rx,ry,rw,rh] = [Math.min(sx,cx),Math.min(sy,cy),Math.abs(cx-sx),Math.abs(cy-sy)];
+    ctx.strokeStyle = '#0ea5e9'; ctx.lineWidth = 2; ctx.setLineDash([6,3]);
+    ctx.strokeRect(rx,ry,rw,rh); ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(14,165,233,0.08)'; ctx.fillRect(rx,ry,rw,rh);
+  }
+
+  if (currentMode !== 'editZones') cameras.forEach(drawCamera);
+}
+
+function wrapText(text, cx, cy, maxW, lh) {
+  const words = text.split(' '), lines = [];
+  let line = '';
+  words.forEach(w => {
+    const t = line ? line+' '+w : w;
+    if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = w; }
+    else line = t;
+  });
+  if (line) lines.push(line);
+  const sy = cy - (lines.length-1)*lh/2;
+  lines.forEach((l,i) => ctx.fillText(l, cx, sy+i*lh));
+}
+
+function drawCamera(cam) {
+  const sel = selectedCam && selectedCam.id === cam.id;
+  ctx.save(); ctx.translate(cam.x, cam.y); ctx.rotate(cam.angle * Math.PI/180);
+  ctx.beginPath(); ctx.moveTo(10,0); ctx.lineTo(56,-23); ctx.lineTo(56,23); ctx.closePath();
+  ctx.fillStyle = sel ? 'rgba(251,191,36,0.35)' : 'rgba(14,165,233,0.28)'; ctx.fill();
+  ctx.fillStyle = sel ? '#fbbf24' : '#1e293b';
+  ctx.beginPath(); ctx.roundRect(-13,-8,23,16,4); ctx.fill();
+  ctx.fillStyle = sel ? '#f59e0b' : '#38bdf8';
+  ctx.beginPath(); ctx.arc(12,0,6,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+  ctx.font = 'bold 11px Segoe UI'; ctx.textAlign = 'center';
+  ctx.fillStyle = '#0f172a'; ctx.fillText(cam.name, cam.x, cam.y+24);
+  ctx.fillStyle = '#0ea5e9'; ctx.fillText('👥 '+(cam.person_count||0), cam.x, cam.y+37);
+}
+
+// ── Hit testing ────────────────────────────────────────────────────────────────
+function zoneAt(x, y) {
+  for (let i=zones.length-1; i>=0; i--) {
+    const z=zones[i];
+    if (x>=z.x && x<=z.x+z.w && y>=z.y && y<=z.y+z.h) return z;
+  }
+  return null;
+}
+function camAt(x, y) { return cameras.find(c => Math.hypot(x-c.x, y-c.y) < 18) || null; }
+function getHandles(z) {
+  return [
+    {id:'nw',x:z.x,       y:z.y      }, {id:'n', x:z.x+z.w/2, y:z.y      },
+    {id:'ne',x:z.x+z.w,   y:z.y      }, {id:'e', x:z.x+z.w,   y:z.y+z.h/2},
+    {id:'se',x:z.x+z.w,   y:z.y+z.h  }, {id:'s', x:z.x+z.w/2, y:z.y+z.h  },
+    {id:'sw',x:z.x,        y:z.y+z.h  }, {id:'w', x:z.x,        y:z.y+z.h/2},
+  ];
+}
+function handleAt(x, y, z) {
+  if (!z) return null;
+  return getHandles(z).find(h => Math.abs(x-h.x)<=HS/2+2 && Math.abs(y-h.y)<=HS/2+2) || null;
+}
+function applyResize(z, id, dx, dy) {
+  const n={...z};
+  if(id==='nw'){n.x+=dx;n.y+=dy;n.w-=dx;n.h-=dy;}
+  else if(id==='n'){n.y+=dy;n.h-=dy;}
+  else if(id==='ne'){n.w+=dx;n.y+=dy;n.h-=dy;}
+  else if(id==='e'){n.w+=dx;}
+  else if(id==='se'){n.w+=dx;n.h+=dy;}
+  else if(id==='s'){n.h+=dy;}
+  else if(id==='sw'){n.x+=dx;n.w-=dx;n.h+=dy;}
+  else if(id==='w'){n.x+=dx;n.w-=dx;}
+  n.w=Math.max(n.w,50); n.h=Math.max(n.h,35);
+  return n;
+}
+
+// ── Coords ─────────────────────────────────────────────────────────────────────
+function coords(e) {
+  const r = canvas.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*(MAP_W/r.width), y:(e.clientY-r.top)*(MAP_H/r.height)};
+}
+
+// ── Mouse events ───────────────────────────────────────────────────────────────
+canvas.addEventListener('mousedown', e => {
+  const {x,y} = coords(e);
+  if (currentMode === 'addCam') {
+    pendingCamPos = {x,y};
+    const z = zoneAt(x,y);
+    if (z) document.getElementById('cmZone').value = z.type || z.id;
+    document.getElementById('cmName').value = '';
+    document.getElementById('cmAngle').value = 0;
+    document.getElementById('cmAngleDisp').textContent = '0°';
+    document.getElementById('camModalTitle').textContent = 'Ajouter une caméra';
+    openModal('camModal'); setMode('normal'); return;
+  }
+  if (currentMode === 'editZones') {
+    const h = handleAt(x,y,selectedZone);
+    if (h && selectedZone) { dragState={type:'resize',handleId:h.id,startX:x,startY:y,origZone:{...selectedZone}}; return; }
+    const z = zoneAt(x,y);
+    if (z) { selectedZone=z; showZonePanel(z); dragState={type:'move',startX:x,startY:y,origX:z.x,origY:z.y}; drawMap(); return; }
+    selectedZone=null; hideZonePanel();
+    dragState={type:'draw',startX:x,startY:y,currX:x,currY:y}; drawMap(); return;
+  }
+  // Normal mode: select camera + start drag
+  const c = camAt(x,y); selectedCam=c;
+  if (c) {
+    showCamPanel(c);
+    dragState = { type:'moveCam', cam:c, startX:x, startY:y, origX:c.x, origY:c.y, moved:false };
+  } else hideCamPanel();
+  drawMap();
+});
+
+canvas.addEventListener('mousemove', e => {
+  const {x,y} = coords(e);
+  if (dragState) {
+    const dx=x-dragState.startX, dy=y-dragState.startY;
+    if (dragState.type==='move' && selectedZone) {
+      const i=zones.findIndex(z=>z.id===selectedZone.id);
+      if(i>=0){zones[i].x=dragState.origX+dx; zones[i].y=dragState.origY+dy; selectedZone=zones[i];}
+    } else if (dragState.type==='resize' && selectedZone) {
+      const i=zones.findIndex(z=>z.id===selectedZone.id);
+      if(i>=0){zones[i]=applyResize(dragState.origZone,dragState.handleId,dx,dy); selectedZone=zones[i];}
+    } else if (dragState.type==='draw') {
+      dragState.currX=x; dragState.currY=y;
+    } else if (dragState.type==='moveCam') {
+      const i=cameras.findIndex(c=>c.id===dragState.cam.id);
+      if(i>=0){ cameras[i].x=dragState.origX+dx; cameras[i].y=dragState.origY+dy; }
+      dragState.moved = Math.hypot(dx,dy) > 4;
+    }
+    drawMap();
+  }
+  updateCursor(x,y);
+});
+
+canvas.addEventListener('mouseup', e => {
+  if (!dragState) return;
+  const {x,y} = coords(e);
+  if (dragState.type==='move'||dragState.type==='resize') {
+    autoSaveZones();
+  } else if (dragState.type==='draw') {
+    const rx=Math.min(dragState.startX,x), ry=Math.min(dragState.startY,y);
+    const rw=Math.abs(x-dragState.startX), rh=Math.abs(y-dragState.startY);
+    if(rw>40&&rh>30){pendingNewZone={x:rx,y:ry,w:rw,h:rh}; onNewZoneTypeChange(); openModal('newZoneModal');}
+  } else if (dragState.type==='moveCam' && dragState.moved) {
+    const cam = cameras.find(c=>c.id===dragState.cam.id);
+    if (cam) {
+      fetch('/cameras/'+cam.id, {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ x: Math.round(cam.x), y: Math.round(cam.y) })
+      }).then(()=>loadCameras());
+    }
+  }
+  dragState=null; drawMap();
+});
+
+function updateCursor(x, y) {
+  if (currentMode==='addCam'){canvas.style.cursor='crosshair';return;}
+  if (currentMode==='editZones'){
+    const h=handleAt(x,y,selectedZone);
+    if(h){const m={nw:'nw-resize',n:'n-resize',ne:'ne-resize',e:'e-resize',se:'se-resize',s:'s-resize',sw:'sw-resize',w:'w-resize'};canvas.style.cursor=m[h.id]||'pointer';return;}
+    canvas.style.cursor=zoneAt(x,y)?'move':'crosshair';return;
+  }
+  // Normal mode: grab cursor when over a camera
+  canvas.style.cursor = dragState && dragState.type==='moveCam' ? 'grabbing'
+                       : camAt(x,y) ? 'grab' : 'default';
+}
+
+// ── Mode ───────────────────────────────────────────────────────────────────────
+function setMode(m) {
+  currentMode=m;
+  const hints={normal:'',addCam:'Cliquez sur la carte pour placer la caméra',
+    editZones:'Sélectionner • Glisser pour déplacer • Poignées pour redimensionner • Tracer pour créer'};
+  const ht=document.getElementById('hintText');
+  ht.textContent=hints[m]; ht.style.display=m!=='normal'?'':'none';
+  document.getElementById('btnAddCam').classList.toggle('active', m==='addCam');
+  document.getElementById('btnEditZones').classList.toggle('active', m==='editZones');
+  if(m==='editZones'){hideCamPanel();selectedCam=null;}
+  if(m!=='editZones'){hideZonePanel();selectedZone=null;}
+  drawMap();
+}
+function toggleMode(m){setMode(currentMode===m?'normal':m);}
+
+// ── Zone panel ─────────────────────────────────────────────────────────────────
+function showZonePanel(z) {
+  document.getElementById('zpLabel').value=z.label;
+  document.getElementById('zpType').value=z.type||'custom';
+  document.getElementById('zpColor').value=z.color;
+  document.getElementById('zonePanel').classList.add('visible');
+}
+function hideZonePanel(){document.getElementById('zonePanel').classList.remove('visible');}
+function onZoneLabelChange(){
+  if(!selectedZone)return;
+  const i=zones.findIndex(z=>z.id===selectedZone.id);
+  if(i>=0){zones[i].label=document.getElementById('zpLabel').value;selectedZone=zones[i];}
+  drawMap(); autoSaveZones();
+}
+function onZoneTypeChange(){
+  if(!selectedZone)return;
+  const type=document.getElementById('zpType').value, i=zones.findIndex(z=>z.id===selectedZone.id);
+  if(i>=0){zones[i].type=type; if(ZONE_TYPES[type]){zones[i].color=ZONE_TYPES[type].color;document.getElementById('zpColor').value=ZONE_TYPES[type].color;} selectedZone=zones[i];}
+  drawMap(); autoSaveZones();
+}
+function onZoneColorChange(){
+  if(!selectedZone)return;
+  const i=zones.findIndex(z=>z.id===selectedZone.id);
+  if(i>=0){zones[i].color=document.getElementById('zpColor').value;selectedZone=zones[i];}
+  drawMap(); autoSaveZones();
+}
+function confirmDeleteZone(){
+  if(!selectedZone||!confirm('Supprimer le bloc "'+selectedZone.label+'" ?'))return;
+  zones=zones.filter(z=>z.id!==selectedZone.id); selectedZone=null; hideZonePanel(); drawMap(); autoSaveZones();
+}
+
+// ── New zone modal ─────────────────────────────────────────────────────────────
+function onNewZoneTypeChange(){
+  const t=document.getElementById('nzType').value;
+  if(ZONE_TYPES[t])document.getElementById('nzColor').value=ZONE_TYPES[t].color;
+}
+function closeNewZoneModal(){pendingNewZone=null;closeModal('newZoneModal');drawMap();}
+function confirmNewZone(){
+  if(!pendingNewZone)return;
+  const label=document.getElementById('nzLabel').value.trim()||'Nouvelle zone';
+  const type=document.getElementById('nzType').value;
+  const color=document.getElementById('nzColor').value;
+  const z={id:'zone_'+Date.now(),label,type,color,x:Math.round(pendingNewZone.x),y:Math.round(pendingNewZone.y),w:Math.round(pendingNewZone.w),h:Math.round(pendingNewZone.h)};
+  zones.push(z); selectedZone=z; showZonePanel(z); pendingNewZone=null; closeModal('newZoneModal'); drawMap(); autoSaveZones();
+}
+async function confirmResetZones(){
+  if(!confirm('Réinitialiser la carte aux zones par défaut ?'))return;
+  const r=await fetch('/zones-config/reset',{method:'POST'}); const d=await r.json(); zones=d.zones; selectedZone=null; hideZonePanel(); drawMap();
+}
+async function autoSaveZones(){
+  await fetch('/zones-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({zones})});
+}
+
+// ── Camera panel ───────────────────────────────────────────────────────────────
+function showCamPanel(cam){
+  document.getElementById('cpName').textContent=cam.name;
+  document.getElementById('cpZone').textContent=zoneLabel(cam.zone);
+  document.getElementById('cpAngle').textContent=cam.angle+'°';
+  document.getElementById('cpCount').textContent=cam.person_count||0;
+  document.getElementById('camPanel').classList.add('visible');
+}
+function hideCamPanel(){document.getElementById('camPanel').classList.remove('visible');}
+function zoneLabel(id){const z=zones.find(z=>(z.type||z.id)===id||z.id===id);return z?z.label:id;}
+
+// ── Camera modal ───────────────────────────────────────────────────────────────
+function openCamEditModal(){
+  if(!selectedCam)return;
+  document.getElementById('camModalTitle').textContent='Modifier la caméra';
+  document.getElementById('cmName').value=selectedCam.name;
+  document.getElementById('cmZone').value=selectedCam.zone;
+  document.getElementById('cmAngle').value=selectedCam.angle;
+  document.getElementById('cmAngleDisp').textContent=selectedCam.angle+'°';
+  pendingCamPos=null; openModal('camModal');
+}
+function closeCamModal(){closeModal('camModal');}
+async function saveCam(){
+  const name=document.getElementById('cmName').value.trim();
+  if(!name){alert('Saisissez un nom.');return;}
+  const zone=document.getElementById('cmZone').value;
+  const angle=parseFloat(document.getElementById('cmAngle').value);
+  if(selectedCam&&!pendingCamPos){
+    await fetch('/cameras/'+selectedCam.id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,zone,angle})});
+  } else if(pendingCamPos){
+    await fetch('/cameras',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,x:pendingCamPos.x,y:pendingCamPos.y,angle,zone})});
+    pendingCamPos=null;
+  }
+  closeCamModal(); await loadCameras();
+}
+async function confirmDeleteCam(){
+  if(!selectedCam||!confirm('Supprimer "'+selectedCam.name+'" ?'))return;
+  await fetch('/cameras/'+selectedCam.id,{method:'DELETE'}); selectedCam=null; hideCamPanel(); await loadCameras();
+}
+
+// ── Video modal ────────────────────────────────────────────────────────────────
+function openVideoModal(){
+  if(!selectedCam)return;
+  document.getElementById('videoTitle').textContent=selectedCam.name;
+  document.getElementById('videoStream').src='/cameras/'+selectedCam.id+'/stream';
+  document.getElementById('vCount').textContent=selectedCam.person_count||0;
+  openModal('videoModal');
+  videoCountInterval=setInterval(async()=>{
+    if(!selectedCam)return;
+    const r=await fetch('/cameras/'+selectedCam.id+'/count');
+    const d=await r.json(); document.getElementById('vCount').textContent=d.person_count;
+  },2000);
+}
+function closeVideoModal(){clearInterval(videoCountInterval);document.getElementById('videoStream').src='';closeModal('videoModal');}
+
+// ── Modal helpers ──────────────────────────────────────────────────────────────
+function openModal(id){document.getElementById(id).classList.add('open');}
+function closeModal(id){document.getElementById(id).classList.remove('open');}
+document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{
+  if(e.target===el){closeVideoModal();closeModal('camModal');closeNewZoneModal();}
+}));
+
+// ── Loaders ────────────────────────────────────────────────────────────────────
+async function loadZones(){const r=await fetch('/zones-config');const d=await r.json();zones=d.zones;}
+async function loadCameras(){
+  const r=await fetch('/cameras');const d=await r.json();cameras=d.cameras;
+  if(selectedCam){selectedCam=cameras.find(c=>c.id===selectedCam.id)||null;if(selectedCam)showCamPanel(selectedCam);else hideCamPanel();}
+  drawMap();
+}
+
+(async()=>{await loadZones();await loadCameras();setInterval(loadCameras,3000);})();
+</script>
+"""
+
+
+@app.get("/zones-config")
+def get_zones_config() -> dict[str, object]:
+    return {"zones": zones_config.load_zones()}
+
+
+@app.post("/zones-config")
+def save_zones_config(body: dict) -> dict[str, object]:
+    zones_config.save_zones(body.get("zones", []))
+    return {"ok": True}
+
+
+@app.post("/zones-config/reset")
+def reset_zones_config() -> dict[str, object]:
+    return {"zones": zones_config.reset_to_default()}
+
+
+@app.get("/zones/camera-live")
+def camera_live_data() -> dict[str, object]:
+    cameras = camera_manager.list_cameras()
+    zone_map: dict[str, dict] = {}
+    for cam in cameras:
+        zid = cam.get("zone", "gate")
+        count = video_processor.get_count(cam["id"])
+        if zid not in zone_map:
+            zone_map[zid] = {"zone": zid, "occupancy": 0, "camera_count": 0}
+        zone_map[zid]["occupancy"] += count
+        zone_map[zid]["camera_count"] += 1
+    total_persons = sum(z["occupancy"] for z in zone_map.values())
+    active_cameras = sum(1 for cam in cameras if video_processor.get_count(cam["id"]) > 0)
+    return {
+        "zones": list(zone_map.values()),
+        "total_cameras": len(cameras),
+        "active_cameras": active_cameras,
+        "total_persons": total_persons,
+    }
+
+
+@app.get("/dashboard/map", response_class=HTMLResponse)
+def dashboard_map() -> str:
+    return _shell(
+        "map",
+        "Carte Interactive",
+        "Plan de l'aéroport — ajoutez/modifiez zones et caméras en temps réel",
+        _MAP_STYLE + _MAP_BODY,
+        _MAP_SCRIPT,
+    )

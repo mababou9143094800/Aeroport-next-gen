@@ -57,3 +57,19 @@ class PredictionPoint(BaseModel):
     predicted_wait_minutes: float
     risk_level: Literal["low", "medium", "high"]
 
+
+class CameraCreate(BaseModel):
+    name: str
+    x: float
+    y: float
+    angle: float = 0.0
+    zone: str
+
+
+class CameraUpdate(BaseModel):
+    name: str | None = None
+    x: float | None = None
+    y: float | None = None
+    angle: float | None = None
+    zone: str | None = None
+
