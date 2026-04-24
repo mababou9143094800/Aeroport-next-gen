@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timezone
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from .analytics import airport_kpis, compute_snapshots, latest_snapshot_map
+from .analytics import ZONE_CAPACITY, airport_kpis, compute_snapshots, latest_snapshot_map
 from .fusion import events_to_dataframe
 from .generators import generate_events
-from .models import CameraCreate, CameraUpdate
+from .models import CameraCreate, CameraUpdate, FlowSnapshot, ZoneType
 from .predictor import forecast
 from . import camera_manager, video_processor, zones_config
 
@@ -20,7 +22,15 @@ app = FastAPI(
 )
 
 _lock = Lock()
-_state: dict[str, object] = {"events": [], "snapshots": [], "updated_at": None}
+_state: dict[str, object] = {
+    "events": [],
+    "snapshots": [],
+    "updated_at": None,
+    # Snapshots générés à partir des données caméras réelles
+    "camera_snapshots": [],
+    # Occupancy courante par zone (calculée à partir des flux caméra)
+    "camera_zone_occ": {},
+}
 
 _DASHBOARD_STYLE = """
 <style>
@@ -333,11 +343,98 @@ def _rebuild(minutes: int = 120, avg_events_per_minute: int = 40) -> None:
     _state["updated_at"] = datetime.now(timezone.utc)
 
 
+def _capture_camera_snapshot() -> None:
+    """
+    Échantillonne les compteurs inflow/outflow de chaque caméra active et
+    construit un FlowSnapshot par zone pour alimenter le modèle prédictif.
+
+    Logique d'occupancy :
+      - On part de l'occupancy de la période précédente.
+      - On l'ajuste avec (inflow - outflow) observés sur la caméra.
+      - On ancre la valeur au nombre de personnes en mouvement visible
+        (never less than what the camera actually sees).
+    """
+    cameras = camera_manager.list_cameras()
+    zone_flow: dict[str, dict[str, int]] = {}
+
+    for cam in cameras:
+        zid = cam.get("zone", "gate")
+        counts = video_processor.get_flow_counts(cam["id"])
+        if zid not in zone_flow:
+            zone_flow[zid] = {"inflow": 0, "outflow": 0, "moving": 0}
+        zone_flow[zid]["inflow"] += counts["inflow"]
+        zone_flow[zid]["outflow"] += counts["outflow"]
+        zone_flow[zid]["moving"] += counts["moving"]
+
+    # N'enregistre un snapshot que si au moins une caméra voit des gens
+    has_data = any(v["moving"] > 0 for v in zone_flow.values())
+    if not has_data:
+        return
+
+    now = datetime.now(timezone.utc)
+    new_snaps: list[FlowSnapshot] = []
+
+    with _lock:
+        cam_occ: dict[str, int] = dict(_state.get("camera_zone_occ", {}))  # type: ignore[arg-type]
+
+        for zid, flow in zone_flow.items():
+            try:
+                zone_type = ZoneType(zid)
+            except ValueError:
+                continue
+
+            inflow = flow["inflow"]
+            outflow = flow["outflow"]
+            moving = flow["moving"]
+
+            # Mise à jour de l'occupancy courante
+            prev_occ = cam_occ.get(zid, moving)
+            net = inflow - outflow
+            new_occ = max(moving, int(prev_occ + net))
+            cam_occ[zid] = new_occ
+
+            capacity = ZONE_CAPACITY.get(zid, 500)
+            congestion = min(1.0, new_occ / max(1, capacity))
+            dwell = round(
+                min(new_occ / max(1.0, float(outflow)), 60.0), 2
+            ) if outflow > 0 else max(1.0, round(new_occ / 35.0, 2))
+
+            new_snaps.append(
+                FlowSnapshot(
+                    timestamp=now,
+                    zone=zone_type,
+                    occupancy=new_occ,
+                    inflow_per_min=float(inflow),
+                    outflow_per_min=float(outflow),
+                    avg_dwell_minutes=dwell,
+                    congestion_score=round(congestion, 3),
+                )
+            )
+
+        _state["camera_zone_occ"] = cam_occ
+        existing: list[FlowSnapshot] = _state.get("camera_snapshots", [])  # type: ignore[assignment]
+        # Fenêtre glissante ~30 min (7 zones × 30 échantillons)
+        _state["camera_snapshots"] = (existing + new_snaps)[-300:]
+
+
+def _camera_snapshot_worker() -> None:
+    """Thread de fond : capture un snapshot caméra toutes les 60 secondes."""
+    time.sleep(30)  # délai initial pour laisser les caméras démarrer
+    while True:
+        try:
+            _capture_camera_snapshot()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
 @app.on_event("startup")
 def _startup() -> None:
     with _lock:
         _rebuild()
     video_processor.start_all(camera_manager.list_cameras())
+    t = threading.Thread(target=_camera_snapshot_worker, daemon=True, name="cam-snapshot")
+    t.start()
 
 
 @app.get("/health")
@@ -367,9 +464,16 @@ def home() -> str:
     <script>
       let occupancyChart, congestionChart;
       const CHART_COLORS = ['#0369a1','#0ea5e9','#38bdf8','#7dd3fc','#0284c7','#0891b2','#22d3ee'];
+      let _overviewBusy = false;
 
       async function loadOverview() {
-        getGlobalMode() === 'simulated' ? await loadSimulated() : await loadReal();
+        /* Guard : on ne lance pas un nouvel appel si le précédent est en cours */
+        if (_overviewBusy) return;
+        _overviewBusy = true;
+        try {
+          getGlobalMode() === 'simulated' ? await loadSimulated() : await loadReal();
+        } catch(e) { /* réseau temporairement indisponible, on réessaie au prochain tour */ }
+        finally { _overviewBusy = false; }
       }
 
       async function loadSimulated() {
@@ -417,23 +521,41 @@ def home() -> str:
       function renderCharts(labels, occupancy, dist, title1, title2) {
         document.getElementById('chart1title').textContent = title1;
         document.getElementById('chart2title').textContent = title2;
-        if (occupancyChart) occupancyChart.destroy();
-        occupancyChart = new Chart(document.getElementById('occupancyChart'), {
-          type: 'bar',
-          data: { labels, datasets: [{ label: 'Personnes', data: occupancy, backgroundColor: '#0ea5e9', borderRadius: 6 }] },
-          options: { responsive: true, plugins: { legend: { display: false } } }
-        });
-        if (congestionChart) congestionChart.destroy();
-        congestionChart = new Chart(document.getElementById('congestionChart'), {
-          type: 'doughnut',
-          data: { labels, datasets: [{ data: dist, backgroundColor: CHART_COLORS }] },
-          options: { responsive: true }
-        });
+        /* Mise à jour des données sans destroy/recreate → pas de fuite mémoire */
+        if (occupancyChart) {
+          occupancyChart.data.labels = labels;
+          occupancyChart.data.datasets[0].data = occupancy;
+          occupancyChart.update('none');
+        } else {
+          occupancyChart = new Chart(document.getElementById('occupancyChart'), {
+            type: 'bar',
+            data: { labels, datasets: [{ label: 'Personnes', data: occupancy, backgroundColor: '#0ea5e9', borderRadius: 6 }] },
+            options: { responsive: true, animation: false, plugins: { legend: { display: false } } }
+          });
+        }
+        if (congestionChart) {
+          congestionChart.data.labels = labels;
+          congestionChart.data.datasets[0].data = dist;
+          congestionChart.update('none');
+        } else {
+          congestionChart = new Chart(document.getElementById('congestionChart'), {
+            type: 'doughnut',
+            data: { labels, datasets: [{ data: dist, backgroundColor: CHART_COLORS }] },
+            options: { responsive: true, animation: false }
+          });
+        }
       }
 
-      window.addEventListener('dataModeChange', () => loadOverview());
+      window.addEventListener('dataModeChange', () => {
+        /* Réinitialise les charts lors d'un changement de mode */
+        if (occupancyChart) { occupancyChart.destroy(); occupancyChart = null; }
+        if (congestionChart) { congestionChart.destroy(); congestionChart = null; }
+        loadOverview();
+      });
       loadOverview();
-      setInterval(loadOverview, 5000);
+      /* setTimeout récursif : l'intervalle démarre APRÈS la fin du fetch précédent */
+      function scheduleOverview() { setTimeout(async () => { await loadOverview(); scheduleOverview(); }, 10000); }
+      scheduleOverview();
     </script>
     """
     return _shell("overview", "Operations Overview", "Live KPIs — source de données dans la barre latérale", body, script)
@@ -467,7 +589,23 @@ def dashboard_zones() -> str:
     script = """
     <script>
       let flowChart, dwellChart;
+      let _lastFlowMode = null;
       const DWELL_COLORS = ['#106b9a','#239ccf','#42acdb','#6fb8dd','#1584bf','#1b94b2','#33b9cf'];
+
+      function _updateOrCreate(chartRef, canvasId, type, data, options) {
+        if (chartRef && chartRef.config.type === type) {
+          chartRef.data.labels = data.labels;
+          data.datasets.forEach((ds, i) => {
+            if (chartRef.data.datasets[i]) {
+              chartRef.data.datasets[i].data = ds.data;
+            }
+          });
+          chartRef.update('none');
+          return chartRef;
+        }
+        if (chartRef) chartRef.destroy();
+        return new Chart(document.getElementById(canvasId), { type, data, options });
+      }
 
       async function loadZones() {
         getGlobalMode() === 'simulated' ? await loadZonesSim() : await loadZonesReal();
@@ -480,25 +618,20 @@ def dashboard_zones() -> str:
         const d = await r.json();
         const zones = d.zones || [];
         const labels = zones.map(z => z.zone);
-
-        if (flowChart) flowChart.destroy();
-        flowChart = new Chart(document.getElementById('flowChart'), {
-          type: 'bar',
-          data: { labels, datasets: [
-            { label: 'Inflow/min', data: zones.map(z => z.inflow_per_min), backgroundColor: '#10b981', borderRadius: 5 },
-            { label: 'Outflow/min', data: zones.map(z => z.outflow_per_min), backgroundColor: '#f97316', borderRadius: 5 }
-          ]},
-          options: { responsive: true }
-        });
-
-        if (dwellChart) dwellChart.destroy();
-        dwellChart = new Chart(document.getElementById('dwellChart'), {
-          type: 'doughnut',
-          data: { labels, datasets: [{ label: 'Dwell min', data: zones.map(z => z.avg_dwell_minutes),
-            backgroundColor: DWELL_COLORS, borderColor: '#e2e8f0', borderWidth: 2 }] },
-          options: { responsive: true, cutout: '48%', plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 18, padding: 14 } } } }
-        });
-
+        const flowOpts = { responsive: true, animation: false };
+        const dwellOpts = { responsive: true, animation: false, cutout: '48%',
+          plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 18, padding: 14 } } } };
+        if (_lastFlowMode !== 'sim') { if (flowChart) { flowChart.destroy(); flowChart = null; }
+                                       if (dwellChart) { dwellChart.destroy(); dwellChart = null; } }
+        _lastFlowMode = 'sim';
+        flowChart = _updateOrCreate(flowChart, 'flowChart', 'bar', { labels, datasets: [
+          { label: 'Inflow/min', data: zones.map(z => z.inflow_per_min), backgroundColor: '#10b981', borderRadius: 5 },
+          { label: 'Outflow/min', data: zones.map(z => z.outflow_per_min), backgroundColor: '#f97316', borderRadius: 5 }
+        ]}, flowOpts);
+        dwellChart = _updateOrCreate(dwellChart, 'dwellChart', 'doughnut', { labels, datasets: [{
+          label: 'Dwell min', data: zones.map(z => z.avg_dwell_minutes),
+          backgroundColor: DWELL_COLORS, borderColor: '#e2e8f0', borderWidth: 2
+        }]}, dwellOpts);
         document.getElementById('zones-table').innerHTML = zones.map(z => `
           <tr><td>${z.zone}</td><td>${z.occupancy}</td>
               <td>${z.inflow_per_min.toFixed(2)}</td><td>${z.outflow_per_min.toFixed(2)}</td>
@@ -507,34 +640,35 @@ def dashboard_zones() -> str:
       }
 
       async function loadZonesReal() {
-        document.getElementById('flowTitle').textContent = 'Personnes en mouvement par zone (caméras)';
-        document.getElementById('dwellTitle').textContent = 'Répartition par zone (caméras)';
+        document.getElementById('flowTitle').textContent = 'Inflow vs Outflow par zone (caméras)';
+        document.getElementById('dwellTitle').textContent = 'Dwell estimé par zone (caméras)';
         const r = await fetch('/zones/camera-live');
         const d = await r.json();
         const zones = d.zones || [];
         const labels = zones.map(z => z.zone);
-        const counts = zones.map(z => z.occupancy);
-
-        if (flowChart) flowChart.destroy();
-        flowChart = new Chart(document.getElementById('flowChart'), {
-          type: 'bar',
-          data: { labels, datasets: [
-            { label: 'Personnes en mvt.', data: counts, backgroundColor: '#0ea5e9', borderRadius: 5 }
-          ]},
-          options: { responsive: true, plugins: { legend: { display: false } } }
-        });
-
-        if (dwellChart) dwellChart.destroy();
-        dwellChart = new Chart(document.getElementById('dwellChart'), {
-          type: 'doughnut',
-          data: { labels, datasets: [{ data: counts, backgroundColor: DWELL_COLORS, borderColor: '#e2e8f0', borderWidth: 2 }] },
-          options: { responsive: true, cutout: '48%', plugins: { legend: { display: true, position: 'top', labels: { boxWidth: 18, padding: 14 } } } }
-        });
-
+        const barOpts = { responsive: true, animation: false, plugins: { legend: { display: true } },
+                          scales: { x: { stacked: false }, y: { beginAtZero: true } } };
+        const dwellOpts = { responsive: true, animation: false, plugins: { legend: { display: false } },
+                            scales: { y: { beginAtZero: true, title: { display: true, text: 'min' } } } };
+        if (_lastFlowMode !== 'real') { if (flowChart) { flowChart.destroy(); flowChart = null; }
+                                        if (dwellChart) { dwellChart.destroy(); dwellChart = null; } }
+        _lastFlowMode = 'real';
+        flowChart = _updateOrCreate(flowChart, 'flowChart', 'bar', { labels, datasets: [
+          { label: 'Inflow', data: zones.map(z => z.inflow_per_min || 0), backgroundColor: '#10b981', borderRadius: 5 },
+          { label: 'Outflow', data: zones.map(z => z.outflow_per_min || 0), backgroundColor: '#f97316', borderRadius: 5 }
+        ]}, barOpts);
+        dwellChart = _updateOrCreate(dwellChart, 'dwellChart', 'bar', { labels, datasets: [{
+          label: 'Dwell (min)', data: zones.map(z => z.avg_dwell_minutes || 0),
+          backgroundColor: DWELL_COLORS.slice(0, labels.length), borderRadius: 5
+        }]}, dwellOpts);
         document.getElementById('zones-table').innerHTML = zones.map(z => `
-          <tr><td>${z.zone}</td><td>${z.occupancy}</td>
-              <td colspan="2" style="color:#475569;font-style:italic">— (données caméra)</td>
-              <td>—</td><td>${z.camera_count} cam.</td></tr>
+          <tr>
+            <td>${z.zone}</td><td>${z.occupancy}</td>
+            <td>${(z.inflow_per_min || 0).toFixed(1)}</td>
+            <td>${(z.outflow_per_min || 0).toFixed(1)}</td>
+            <td>${(z.avg_dwell_minutes || 0).toFixed(2)}</td>
+            <td>${((z.congestion_score || 0) * 100).toFixed(1)}%</td>
+          </tr>
         `).join('');
       }
 
@@ -615,12 +749,21 @@ def dashboard_predictions() -> str:
         `).join('');
       }
       async function loadRealBanner() {
-        const r = await fetch('/zones/camera-live');
-        const d = await r.json();
+        const [cr, pr] = await Promise.all([
+          fetch('/zones/camera-live'),
+          fetch('/predictions?horizon_min=30'),
+        ]);
+        const d = await cr.json();
+        const pd = await pr.json();
         const b = document.getElementById('realBanner');
-        b.innerHTML = '<strong>Caméras actives&nbsp;: ' + (d.active_cameras||0) + ' / ' + (d.total_cameras||0) +
-          '</strong> &nbsp;&bull;&nbsp; Personnes en mvt. au total&nbsp;: <strong>' + (d.total_persons||0) +
-          '</strong> &nbsp;&bull;&nbsp; <em>Les prédictions sont toujours basées sur la simulation</em>';
+        const src = pd.source || d.prediction_source || 'simulation';
+        const srcLabel = src === 'cameras'
+          ? '<span style="color:#4ade80">&#9679; Prédictions basées sur les caméras réelles</span>'
+          : '<span style="color:#f59e0b">&#9679; Prédictions basées sur la simulation (caméras en cours de chauffe)</span>';
+        b.innerHTML =
+          '<strong>Caméras actives&nbsp;: ' + (d.active_cameras||0) + ' / ' + (d.total_cameras||0) +
+          '</strong> &nbsp;&bull;&nbsp; Personnes en mvt.&nbsp;: <strong>' + (d.total_persons||0) +
+          '</strong> &nbsp;&bull;&nbsp; ' + srcLabel;
         b.style.display = '';
       }
 
@@ -678,10 +821,19 @@ def get_latest_zone_states() -> dict[str, object]:
 @app.get("/predictions")
 def get_predictions(horizon_min: int = 30) -> dict[str, object]:
     with _lock:
-        preds = forecast(_state["snapshots"], horizon_min=horizon_min)
+        cam_snaps: list[FlowSnapshot] = _state.get("camera_snapshots", [])  # type: ignore[assignment]
+        # Utilise les données caméra réelles si on a suffisamment d'historique
+        # (>= 3 snapshots = au moins 3 zones ou 3 périodes de capture)
+        if len(cam_snaps) >= 3:
+            preds = forecast(cam_snaps, horizon_min=horizon_min)
+            source = "cameras"
+        else:
+            preds = forecast(_state["snapshots"], horizon_min=horizon_min)
+            source = "simulation"
         return {
             "updated_at": _state["updated_at"],
             "horizon_min": horizon_min,
+            "source": source,
             "predictions": [p.model_dump() for p in preds],
         }
 
@@ -707,7 +859,7 @@ def create_camera_api(body: CameraCreate) -> dict[str, object]:
         angle=body.angle,
         zone=body.zone,
     )
-    video_processor.start_processor(cam["id"], cam["folder"])
+    video_processor.start_processor(cam["id"], cam["folder"], cam.get("angle", 0.0))
     return cam
 
 
@@ -743,6 +895,12 @@ def stream_camera(camera_id: str):
     return StreamingResponse(
         video_processor.frame_generator(camera_id),
         media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            # Empêche tout cache ou buffering côté navigateur/proxy
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -1327,7 +1485,15 @@ async function loadCameras(){
   drawMap();
 }
 
-(async()=>{await loadZones();await loadCameras();setInterval(loadCameras,3000);})();
+(async()=>{
+  await loadZones(); await loadCameras();
+  let _camBusy=false;
+  async function pollCameras(){
+    if(!_camBusy){_camBusy=true;try{await loadCameras();}catch(e){}finally{_camBusy=false;}}
+    setTimeout(pollCameras,10000);
+  }
+  pollCameras();
+})();
 </script>
 """
 
@@ -1354,18 +1520,46 @@ def camera_live_data() -> dict[str, object]:
     zone_map: dict[str, dict] = {}
     for cam in cameras:
         zid = cam.get("zone", "gate")
-        count = video_processor.get_count(cam["id"])
+        counts = video_processor.get_flow_counts(cam["id"])
         if zid not in zone_map:
-            zone_map[zid] = {"zone": zid, "occupancy": 0, "camera_count": 0}
-        zone_map[zid]["occupancy"] += count
+            zone_map[zid] = {
+                "zone": zid,
+                "occupancy": 0,
+                "inflow": 0,
+                "outflow": 0,
+                "camera_count": 0,
+            }
+        zone_map[zid]["occupancy"] += counts["moving"]
+        zone_map[zid]["inflow"] += counts["inflow"]
+        zone_map[zid]["outflow"] += counts["outflow"]
         zone_map[zid]["camera_count"] += 1
+
+    # Enrichissement : dwell estimé + congestion_score + noms normalisés pour le frontend
+    for zid, z in zone_map.items():
+        occ = z["occupancy"]
+        out = z["outflow"]
+        capacity = ZONE_CAPACITY.get(zid, 500)
+        z["congestion_score"] = round(min(1.0, occ / max(1, capacity)), 3)
+        # Dwell = occupancy / débit de sortie (borné entre 1 et 60 min)
+        z["avg_dwell_minutes"] = round(
+            min(60.0, occ / max(1.0, float(out))), 2
+        ) if out > 0 else round(min(60.0, max(1.0, occ / 35.0)), 2)
+        # Alias inflow_per_min / outflow_per_min pour cohérence avec les snapshots simulés
+        z["inflow_per_min"] = float(z["inflow"])
+        z["outflow_per_min"] = float(z["outflow"])
+
     total_persons = sum(z["occupancy"] for z in zone_map.values())
-    active_cameras = sum(1 for cam in cameras if video_processor.get_count(cam["id"]) > 0)
+    active_cameras = sum(
+        1 for cam in cameras if video_processor.get_count(cam["id"]) > 0
+    )
+    with _lock:
+        cam_snaps_count = len(_state.get("camera_snapshots", []))
     return {
         "zones": list(zone_map.values()),
         "total_cameras": len(cameras),
         "active_cameras": active_cameras,
         "total_persons": total_persons,
+        "prediction_source": "cameras" if cam_snaps_count >= 3 else "simulation",
     }
 
 
