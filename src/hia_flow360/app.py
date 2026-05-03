@@ -359,7 +359,7 @@ def _capture_camera_snapshot() -> None:
 
     for cam in cameras:
         zid = cam.get("zone", "gate")
-        counts = video_processor.get_flow_counts(cam["id"])
+        counts = video_processor.consume_flow_counts(cam["id"])
         if zid not in zone_flow:
             zone_flow[zid] = {"inflow": 0, "outflow": 0, "moving": 0}
         zone_flow[zid]["inflow"] += counts["inflow"]
@@ -850,6 +850,11 @@ def list_cameras_api() -> dict[str, object]:
     return {"cameras": cams}
 
 
+@app.get("/cameras/usb-devices")
+def list_usb_devices_api() -> dict[str, object]:
+    return {"devices": video_processor.list_usb_cameras()}
+
+
 @app.post("/cameras", status_code=201)
 def create_camera_api(body: CameraCreate) -> dict[str, object]:
     cam = camera_manager.create_camera(
@@ -858,8 +863,13 @@ def create_camera_api(body: CameraCreate) -> dict[str, object]:
         y=body.y,
         angle=body.angle,
         zone=body.zone,
+        source_type=body.source_type,
+        usb_index=body.usb_index,
     )
-    video_processor.start_processor(cam["id"], cam["folder"], cam.get("angle", 0.0))
+    video_processor.start_processor(
+        cam["id"], cam["folder"], cam.get("angle", 0.0),
+        cam.get("source_type", "file"), cam.get("usb_index"),
+    )
     return cam
 
 
@@ -872,9 +882,18 @@ def update_camera_api(camera_id: str, body: CameraUpdate) -> dict[str, object]:
         y=body.y,
         angle=body.angle,
         zone=body.zone,
+        source_type=body.source_type,
+        usb_index=body.usb_index,
     )
     if cam is None:
         raise HTTPException(status_code=404, detail="Camera not found")
+    video_processor.update_processor(
+        camera_id,
+        angle=body.angle,
+        source_type=body.source_type,
+        usb_index=body.usb_index,
+        folder=cam.get("folder"),
+    )
     return cam
 
 
@@ -996,6 +1015,39 @@ _MAP_STYLE = """
     border-radius: 999px; padding: 0.2rem 0.75rem;
     font-weight: 700; font-size: 0.9rem; margin-top: 0.5rem;
   }
+
+  /* ── Croix directionnelle (D-pad) ────────────────────────── */
+  .dpad {
+    display: grid;
+    grid-template-columns: repeat(3, 38px);
+    grid-template-rows: repeat(3, 38px);
+    gap: 3px;
+    margin: 0.35rem auto;
+    width: fit-content;
+  }
+  .dpad-btn {
+    width: 38px; height: 38px;
+    border: 1.5px solid #cbd5e1; border-radius: 6px;
+    background: #f1f5f9; cursor: pointer; font-size: 1.1rem; padding: 0;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .dpad-btn:hover { background: #dbeafe; border-color: #93c5fd; }
+  .dpad-btn.selected { background: #0ea5e9; color: #fff; border-color: #0369a1; }
+  .dpad-center { width: 38px; height: 38px; }
+  .dpad-info { font-size: 0.78rem; color: #64748b; text-align: center; margin-top: 0.2rem; }
+
+  /* ── Source vidéo ────────────────────────────────────────── */
+  .source-toggle { display: flex; gap: 1rem; }
+  .source-toggle label {
+    display: flex; align-items: center; gap: 0.3rem;
+    font-size: 0.88rem; cursor: pointer;
+  }
+  .btn-refresh {
+    font-size: 0.74rem; padding: 1px 6px;
+    background: #64748b; color: #fff;
+    border: none; border-radius: 4px; cursor: pointer; margin-left: 4px;
+  }
+  .btn-refresh:hover { background: #475569; }
 </style>
 """
 
@@ -1023,7 +1075,8 @@ _MAP_BODY = """
   <div id="camPanel" class="side-panel">
     <h3 id="cpName">Caméra</h3>
     <div class="info-row">Zone&nbsp;: <strong id="cpZone"></strong></div>
-    <div class="info-row">Orientation&nbsp;: <strong id="cpAngle"></strong></div>
+    <div class="info-row">Inflo&nbsp;: <strong id="cpInflow"></strong></div>
+    <div class="info-row">Source&nbsp;: <strong id="cpSource"></strong></div>
     <div class="info-row">En mouvement&nbsp;: <span class="count-big" id="cpCount">0</span></div>
     <div class="panel-btns">
       <button class="btn" onclick="openVideoModal()">Voir le flux</button>
@@ -1064,11 +1117,14 @@ _MAP_BODY = """
 
 <!-- Camera add / edit modal -->
 <div class="modal-overlay" id="camModal">
-  <div class="modal-box">
+  <div class="modal-box" style="width:410px">
     <h3 id="camModalTitle">Ajouter une caméra</h3>
-    <div class="form-group"><label>Nom</label>
-      <input type="text" id="cmName" placeholder="ex: Cam Sécurité Nord" /></div>
-    <div class="form-group"><label>Zone</label>
+    <div class="form-group">
+      <label>Nom</label>
+      <input type="text" id="cmName" placeholder="ex: Cam Sécurité Nord" />
+    </div>
+    <div class="form-group">
+      <label>Zone</label>
       <select id="cmZone">
         <option value="checkin">Enregistrement</option>
         <option value="security">Sécurité</option>
@@ -1077,11 +1133,38 @@ _MAP_BODY = """
         <option value="retail">Boutiques</option>
         <option value="gate">Embarquement</option>
         <option value="baggage">Bagages</option>
-      </select></div>
+      </select>
+    </div>
     <div class="form-group">
-      <label>Orientation&nbsp;: <strong id="cmAngleDisp">0°</strong></label>
-      <input type="range" id="cmAngle" min="0" max="359" value="0"
-             oninput="document.getElementById('cmAngleDisp').textContent=this.value+'°';" /></div>
+      <label>Sens de l'inflo</label>
+      <div class="dpad" id="cmDpad">
+        <button type="button" class="dpad-btn" onclick="setDpadDir('nw')" id="dpad-nw" title="Nord-Ouest">↖</button>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('n')"  id="dpad-n"  title="Nord">↑</button>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('ne')" id="dpad-ne" title="Nord-Est">↗</button>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('w')"  id="dpad-w"  title="Ouest">←</button>
+        <div class="dpad-center"></div>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('e')"  id="dpad-e"  title="Est">→</button>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('sw')" id="dpad-sw" title="Sud-Ouest">↙</button>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('s')"  id="dpad-s"  title="Sud">↓</button>
+        <button type="button" class="dpad-btn" onclick="setDpadDir('se')" id="dpad-se" title="Sud-Est">↘</button>
+      </div>
+      <div class="dpad-info">
+        Inflo&nbsp;: <strong id="cmInflowLbl">→ Est</strong>
+        &nbsp;|&nbsp;
+        Outflow&nbsp;: <strong id="cmOutflowLbl">← Ouest</strong>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Source vidéo</label>
+      <div class="source-toggle">
+        <label><input type="radio" name="cmSource" value="file" checked onchange="onSourceChange()"> Fichiers</label>
+        <label><input type="radio" name="cmSource" value="usb" onchange="onSourceChange()"> Caméra USB</label>
+      </div>
+    </div>
+    <div class="form-group" id="cmUsbGroup" style="display:none">
+      <label>Périphérique <button type="button" class="btn-refresh" onclick="refreshUsbDevices()">↺ Actualiser</button></label>
+      <select id="cmUsbIndex"><option value="">Recherche…</option></select>
+    </div>
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeCamModal()">Annuler</button>
       <button class="btn" onclick="saveCam()">Enregistrer</button>
@@ -1270,8 +1353,9 @@ canvas.addEventListener('mousedown', e => {
     const z = zoneAt(x,y);
     if (z) document.getElementById('cmZone').value = z.type || z.id;
     document.getElementById('cmName').value = '';
-    document.getElementById('cmAngle').value = 0;
-    document.getElementById('cmAngleDisp').textContent = '0°';
+    setDpadDir('e');
+    document.querySelectorAll('input[name="cmSource"]').forEach(r => { r.checked = r.value === 'file'; });
+    document.getElementById('cmUsbGroup').style.display = 'none';
     document.getElementById('camModalTitle').textContent = 'Ajouter une caméra';
     openModal('camModal'); setMode('normal'); return;
   }
@@ -1415,38 +1499,116 @@ async function autoSaveZones(){
   await fetch('/zones-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({zones})});
 }
 
+// ── D-pad directionnel ─────────────────────────────────────────────────────────
+const DIR_ANGLES   = {nw:225, n:270, ne:315, w:180, e:0, sw:135, s:90, se:45};
+const DIR_LABELS   = {nw:'↖ NW', n:'↑ N', ne:'↗ NE', w:'← O', e:'→ E', sw:'↙ SO', s:'↓ S', se:'↘ SE'};
+const DIR_OPPOSITES= {n:'s', s:'n', e:'w', w:'e', ne:'sw', sw:'ne', nw:'se', se:'nw'};
+let currentDpadDir = 'e';
+
+function setDpadDir(dir) {
+  currentDpadDir = dir;
+  document.querySelectorAll('.dpad-btn').forEach(b => b.classList.remove('selected'));
+  const btn = document.getElementById('dpad-' + dir);
+  if (btn) btn.classList.add('selected');
+  document.getElementById('cmInflowLbl').textContent  = DIR_LABELS[dir]            || dir;
+  document.getElementById('cmOutflowLbl').textContent = DIR_LABELS[DIR_OPPOSITES[dir]] || '—';
+}
+
+function angleToDir(angle) {
+  const a = ((angle % 360) + 360) % 360;
+  let best = 'e', bestDiff = 360;
+  for (const [d, da] of Object.entries(DIR_ANGLES)) {
+    const diff = Math.abs(((a - da + 180 + 360) % 360) - 180);
+    if (diff < bestDiff) { bestDiff = diff; best = d; }
+  }
+  return best;
+}
+
+// ── Source USB ─────────────────────────────────────────────────────────────────
+function onSourceChange() {
+  const isUsb = document.querySelector('input[name="cmSource"]:checked').value === 'usb';
+  document.getElementById('cmUsbGroup').style.display = isUsb ? '' : 'none';
+  if (isUsb) refreshUsbDevices();
+}
+
+async function refreshUsbDevices() {
+  const sel = document.getElementById('cmUsbIndex');
+  sel.innerHTML = '<option value="">Recherche…</option>';
+  try {
+    const r = await fetch('/cameras/usb-devices');
+    const d = await r.json();
+    sel.innerHTML = '';
+    if (!d.devices.length) {
+      sel.innerHTML = '<option value="">Aucune caméra détectée</option>';
+      return;
+    }
+    d.devices.forEach(dev => {
+      const opt = document.createElement('option');
+      opt.value = dev.index;
+      opt.textContent = dev.label;
+      sel.appendChild(opt);
+    });
+  } catch(e) {
+    sel.innerHTML = '<option value="">Erreur de détection</option>';
+  }
+}
+
 // ── Camera panel ───────────────────────────────────────────────────────────────
-function showCamPanel(cam){
-  document.getElementById('cpName').textContent=cam.name;
-  document.getElementById('cpZone').textContent=zoneLabel(cam.zone);
-  document.getElementById('cpAngle').textContent=cam.angle+'°';
-  document.getElementById('cpCount').textContent=cam.person_count||0;
+function showCamPanel(cam) {
+  document.getElementById('cpName').textContent   = cam.name;
+  document.getElementById('cpZone').textContent   = zoneLabel(cam.zone);
+  document.getElementById('cpInflow').textContent = DIR_LABELS[angleToDir(cam.angle || 0)] || (cam.angle + '°');
+  document.getElementById('cpSource').textContent = (cam.source_type === 'usb')
+    ? 'USB ' + cam.usb_index : 'Fichiers';
+  document.getElementById('cpCount').textContent  = cam.person_count || 0;
   document.getElementById('camPanel').classList.add('visible');
 }
 function hideCamPanel(){document.getElementById('camPanel').classList.remove('visible');}
 function zoneLabel(id){const z=zones.find(z=>(z.type||z.id)===id||z.id===id);return z?z.label:id;}
 
 // ── Camera modal ───────────────────────────────────────────────────────────────
-function openCamEditModal(){
-  if(!selectedCam)return;
-  document.getElementById('camModalTitle').textContent='Modifier la caméra';
-  document.getElementById('cmName').value=selectedCam.name;
-  document.getElementById('cmZone').value=selectedCam.zone;
-  document.getElementById('cmAngle').value=selectedCam.angle;
-  document.getElementById('cmAngleDisp').textContent=selectedCam.angle+'°';
-  pendingCamPos=null; openModal('camModal');
+function openCamEditModal() {
+  if (!selectedCam) return;
+  document.getElementById('camModalTitle').textContent = 'Modifier la caméra';
+  document.getElementById('cmName').value  = selectedCam.name;
+  document.getElementById('cmZone').value  = selectedCam.zone;
+  setDpadDir(angleToDir(selectedCam.angle || 0));
+  const src = selectedCam.source_type || 'file';
+  document.querySelectorAll('input[name="cmSource"]').forEach(r => { r.checked = r.value === src; });
+  if (src === 'usb') {
+    document.getElementById('cmUsbGroup').style.display = '';
+    refreshUsbDevices().then(() => {
+      if (selectedCam.usb_index != null)
+        document.getElementById('cmUsbIndex').value = selectedCam.usb_index;
+    });
+  } else {
+    document.getElementById('cmUsbGroup').style.display = 'none';
+  }
+  pendingCamPos = null;
+  openModal('camModal');
 }
 function closeCamModal(){closeModal('camModal');}
-async function saveCam(){
-  const name=document.getElementById('cmName').value.trim();
-  if(!name){alert('Saisissez un nom.');return;}
-  const zone=document.getElementById('cmZone').value;
-  const angle=parseFloat(document.getElementById('cmAngle').value);
-  if(selectedCam&&!pendingCamPos){
-    await fetch('/cameras/'+selectedCam.id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,zone,angle})});
-  } else if(pendingCamPos){
-    await fetch('/cameras',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,x:pendingCamPos.x,y:pendingCamPos.y,angle,zone})});
-    pendingCamPos=null;
+
+async function saveCam() {
+  const name = document.getElementById('cmName').value.trim();
+  if (!name) { alert('Saisissez un nom.'); return; }
+  const zone        = document.getElementById('cmZone').value;
+  const angle       = DIR_ANGLES[currentDpadDir] ?? 0;
+  const source_type = document.querySelector('input[name="cmSource"]:checked').value;
+  const usb_index   = source_type === 'usb'
+    ? (parseInt(document.getElementById('cmUsbIndex').value) || 0)
+    : null;
+  if (selectedCam && !pendingCamPos) {
+    await fetch('/cameras/'+selectedCam.id, {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, zone, angle, source_type, usb_index})
+    });
+  } else if (pendingCamPos) {
+    await fetch('/cameras', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name, x:pendingCamPos.x, y:pendingCamPos.y, angle, zone, source_type, usb_index})
+    });
+    pendingCamPos = null;
   }
   closeCamModal(); await loadCameras();
 }

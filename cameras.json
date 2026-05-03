@@ -4,76 +4,12 @@
     "name": "cam transit - embarquement",
     "x": 406.0,
     "y": 107.0,
-    "angle": 109.0,
+    "angle": 180.0,
     "zone": "security",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\bb29c6db",
+    "folder": "C:\\Users\\mathm\\Documents\\efrei\\ING 1\\Projet aéroport\\Aeroport-next-gen\\videos\\bb29c6db",
     "active": true,
-    "person_count": 0
-  },
-  {
-    "id": "044dacfa",
-    "name": "Douane",
-    "x": 182.68891951818782,
-    "y": 120.0,
-    "angle": 0.0,
-    "zone": "immigration",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\044dacfa",
-    "active": true,
-    "person_count": 0
-  },
-  {
-    "id": "075d4c81",
-    "name": "Enregistrement",
-    "x": 145.7292103633567,
-    "y": 393.45454545454544,
-    "angle": 254.0,
-    "zone": "checkin",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\075d4c81",
-    "active": true,
-    "person_count": 0
-  },
-  {
-    "id": "5e93c43a",
-    "name": "boutique",
-    "x": 398.0,
-    "y": 401.0,
-    "angle": 188.0,
-    "zone": "retail",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\5e93c43a",
-    "active": true,
-    "person_count": 0
-  },
-  {
-    "id": "eab1de16",
-    "name": "baggages",
-    "x": 562.0916481892092,
-    "y": 339.1515151515152,
-    "angle": 58.0,
-    "zone": "baggage",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\eab1de16",
-    "active": true,
-    "person_count": 0
-  },
-  {
-    "id": "4d9aa827",
-    "name": "Transit",
-    "x": 566.6173268612293,
-    "y": 123.87878787878788,
-    "angle": 359.0,
-    "zone": "transfer",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\4d9aa827",
-    "active": true,
-    "person_count": 0
-  },
-  {
-    "id": "71e58b4a",
-    "name": "Embarquement",
-    "x": 1023.0,
-    "y": 446.0,
-    "angle": 234.0,
-    "zone": "gate",
-    "folder": "D:\\travail\\ING1\\Projet aéroport\\Aeroport-next-gen\\videos\\71e58b4a",
-    "active": true,
-    "person_count": 0
+    "person_count": 0,
+    "source_type": "file",
+    "usb_index": null
   }
 ]

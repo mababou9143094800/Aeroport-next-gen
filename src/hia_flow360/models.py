@@ -64,6 +64,8 @@ class CameraCreate(BaseModel):
     y: float
     angle: float = 0.0
     zone: str
+    source_type: str = "file"
+    usb_index: int | None = None
 
 
 class CameraUpdate(BaseModel):
@@ -72,4 +74,6 @@ class CameraUpdate(BaseModel):
     y: float | None = None
     angle: float | None = None
     zone: str | None = None
+    source_type: str | None = None
+    usb_index: int | None = None
 

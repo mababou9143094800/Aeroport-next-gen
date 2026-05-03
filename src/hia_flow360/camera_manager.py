@@ -32,7 +32,10 @@ def get_camera(camera_id: str) -> dict | None:
         return next((c for c in _load() if c["id"] == camera_id), None)
 
 
-def create_camera(name: str, x: float, y: float, angle: float, zone: str) -> dict:
+def create_camera(
+    name: str, x: float, y: float, angle: float, zone: str,
+    source_type: str = "file", usb_index: int | None = None,
+) -> dict:
     with _lock:
         cameras = _load()
         camera_id = uuid.uuid4().hex[:8]
@@ -48,6 +51,8 @@ def create_camera(name: str, x: float, y: float, angle: float, zone: str) -> dic
             "folder": folder,
             "active": True,
             "person_count": 0,
+            "source_type": source_type,
+            "usb_index": usb_index,
         }
         cameras.append(camera)
         _save(cameras)
@@ -59,7 +64,10 @@ def update_camera(camera_id: str, **kwargs) -> dict | None:
         cameras = _load()
         for i, c in enumerate(cameras):
             if c["id"] == camera_id:
-                cameras[i].update({k: v for k, v in kwargs.items() if v is not None})
+                for k, v in kwargs.items():
+                    # usb_index peut légitimement être None (source_type=file)
+                    if v is not None or k == "usb_index":
+                        cameras[i][k] = v
                 _save(cameras)
                 return cameras[i]
         return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import platform as _platform
 import threading
 import time
 from collections import deque
@@ -27,6 +28,9 @@ _processors: dict[str, "CameraProcessor"] = {}
 _plock = threading.Lock()
 
 _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
+
+# Backend OpenCV pour les caméras USB (DirectShow sur Windows, auto ailleurs)
+_USB_BACKEND: int = cv2.CAP_DSHOW if (_CV2_AVAILABLE and _platform.system() == "Windows") else 0
 
 # ── Filtrage mouvement ────────────────────────────────────────────────────────
 _MOTION_THRESHOLD    = 0.20   # proportion de pixels en mouvement dans la bbox
@@ -207,6 +211,7 @@ class _YoloDispatcher:
             proc.inflow_count   = sum(1 for d in detections if d[6])
             proc.outflow_count  = sum(1 for d in detections if d[7])
             proc.total_detected = len(detections)
+        proc._accumulate_flow(detections)
 
     def _run(self) -> None:
         while True:
@@ -278,10 +283,19 @@ class CameraProcessor:
     La détection se rafraîchit à ~500 ms pour la caméra regardée.
     """
 
-    def __init__(self, camera_id: str, folder: str, angle: float = 0.0) -> None:
-        self.camera_id = camera_id
-        self.folder    = Path(folder)
-        self.angle     = angle
+    def __init__(
+        self,
+        camera_id: str,
+        folder: str,
+        angle: float = 0.0,
+        source_type: str = "file",
+        usb_index: int | None = None,
+    ) -> None:
+        self.camera_id   = camera_id
+        self.folder      = Path(folder)
+        self.angle       = angle
+        self.source_type = source_type
+        self.usb_index   = usb_index if source_type == "usb" else None
 
         # Compteurs publics (mis à jour par le dispatcher)
         self.person_count:   int = 0
@@ -289,9 +303,9 @@ class CameraProcessor:
         self.inflow_count:   int = 0
         self.outflow_count:  int = 0
 
-        # Sens d'entrée selon l'angle de la caméra
-        # cos(angle) >= 0 → caméra orientée vers la droite → droite = entrée
-        self._inflow_is_right: bool = math.cos(math.radians(angle)) >= 0
+        # Vecteur unitaire de direction d'inflo (calculé depuis l'angle)
+        self._inflow_vx: float = math.cos(math.radians(angle))
+        self._inflow_vy: float = math.sin(math.radians(angle))
 
         # Résultats YOLO (dispatcher → video loop)
         self._det_lock   = threading.Lock()
@@ -303,6 +317,13 @@ class CameraProcessor:
             _blank_jpeg("En attente de vidéo…", Path(folder).name)
             if _CV2_AVAILABLE else b""
         )
+
+        # Compteurs accumulés sur la fenêtre courante (entre deux snapshots)
+        # Chaque track_id n'est compté qu'une seule fois par fenêtre.
+        self._inflow_total:    int      = 0
+        self._outflow_total:   int      = 0
+        self._counted_tracks:  set[int] = set()
+        self._flow_acc_lock            = threading.Lock()
 
         # Nombre de viewers actifs (frame_generator ouvert dans le navigateur)
         # Utilisé par le dispatcher pour la priorité YOLO.
@@ -342,6 +363,32 @@ class CameraProcessor:
         with self._viewer_lock:
             self._viewer_count = max(0, self._viewer_count - 1)
 
+    def _accumulate_flow(self, detections: list[tuple]) -> None:
+        """Compte chaque track_id une seule fois par fenêtre de snapshot."""
+        with self._flow_acc_lock:
+            for det in detections:
+                tid     = det[8]
+                flag_in = det[6]
+                flag_out= det[7]
+                if tid in self._counted_tracks:
+                    continue
+                if flag_in:
+                    self._inflow_total += 1
+                    self._counted_tracks.add(tid)
+                elif flag_out:
+                    self._outflow_total += 1
+                    self._counted_tracks.add(tid)
+
+    def consume_flow_counts(self) -> tuple[int, int]:
+        """Retourne (inflow, outflow) accumulés depuis le dernier appel et remet à zéro."""
+        with self._flow_acc_lock:
+            inflow  = self._inflow_total
+            outflow = self._outflow_total
+            self._inflow_total  = 0
+            self._outflow_total = 0
+            self._counted_tracks.clear()
+            return inflow, outflow
+
     def stop(self) -> None:
         self._stop.set()
         _get_dispatcher().unregister(self.camera_id)
@@ -351,6 +398,10 @@ class CameraProcessor:
     def _run(self) -> None:
         if not _CV2_AVAILABLE:
             return
+        if self.source_type == "usb":
+            self._run_usb()
+            return
+        # Mode fichiers
         while not self._stop.is_set():
             videos = (
                 sorted(p for p in self.folder.iterdir() if p.suffix.lower() in _VIDEO_EXTS)
@@ -368,6 +419,32 @@ class CameraProcessor:
                     return
                 self._process_video(path)
 
+    def _run_usb(self) -> None:
+        """Boucle de capture live pour une caméra USB."""
+        while not self._stop.is_set():
+            cap = cv2.VideoCapture(self.usb_index, _USB_BACKEND)
+            if not cap.isOpened():
+                with self._frame_lock:
+                    self._latest_frame = _blank_jpeg(
+                        f"Caméra USB {self.usb_index} introuvable",
+                        "Vérifiez la connexion USB",
+                    )
+                self._stop.wait(3.0)
+                continue
+            fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            delay = 1.0 / min(fps, 30.0)
+            while not self._stop.is_set():
+                t0 = time.perf_counter()
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                self._process_frame(frame)
+                elapsed = time.perf_counter() - t0
+                wait = delay - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+            cap.release()
+
     def _process_video(self, path: Path) -> None:
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
@@ -384,57 +461,58 @@ class CameraProcessor:
             ret, frame = cap.read()
             if not ret:
                 break
-
-            self._frame_count += 1
-            warmed_up = self._frame_count > _WARMUP_FRAMES
-
-            # ── MOG2 (rapide, chaque frame) ───────────────────────────────
-            motion_mask: np.ndarray | None = None
-            if self._bg_sub is not None:
-                fgmask = self._bg_sub.apply(frame)
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                fgmask = cv2.dilate(fgmask, kernel, iterations=2)
-                _, fgmask = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
-                motion_mask = fgmask
-
-            # ── Soumission au dispatcher YOLO (throttlée, non bloquante) ──
-            now = time.perf_counter()
-            if now - self._last_submit >= _SUBMIT_MIN_INTERVAL:
-                _get_dispatcher().submit(
-                    self.camera_id, frame.copy(), motion_mask, warmed_up
-                )
-                self._last_submit = now
-
-            # ── Annotation avec les dernières détections disponibles ───────
-            with self._det_lock:
-                detections = list(self._detections)
-
-            annotated = self._annotate(frame.copy(), detections, warmed_up)
-
-            # ── Encodage JPEG réduit pour le stream ───────────────────────
-            sh, sw = annotated.shape[:2]
-            if sw > _STREAM_MAX_W:
-                sf       = _STREAM_MAX_W / sw
-                stream_f = cv2.resize(
-                    annotated, (_STREAM_MAX_W, int(sh * sf)),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-            else:
-                stream_f = annotated
-
-            _, buf = cv2.imencode(
-                ".jpg", stream_f, [cv2.IMWRITE_JPEG_QUALITY, _STREAM_JPEG_Q]
-            )
-            with self._frame_lock:
-                self._latest_frame = buf.tobytes()
-
-            # Respect de la cadence vidéo (soustrait le temps de traitement)
+            self._process_frame(frame)
             elapsed = time.perf_counter() - t0
             wait    = delay - elapsed
             if wait > 0:
                 time.sleep(wait)
 
         cap.release()
+
+    def _process_frame(self, frame: np.ndarray) -> None:
+        """Traitement commun : MOG2 → YOLO dispatch → annotation → JPEG."""
+        self._frame_count += 1
+        warmed_up = self._frame_count > _WARMUP_FRAMES
+
+        # ── MOG2 (rapide, chaque frame) ───────────────────────────────
+        motion_mask: np.ndarray | None = None
+        if self._bg_sub is not None:
+            fgmask = self._bg_sub.apply(frame)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            fgmask = cv2.dilate(fgmask, kernel, iterations=2)
+            _, fgmask = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
+            motion_mask = fgmask
+
+        # ── Soumission au dispatcher YOLO (throttlée, non bloquante) ──
+        now = time.perf_counter()
+        if now - self._last_submit >= _SUBMIT_MIN_INTERVAL:
+            _get_dispatcher().submit(
+                self.camera_id, frame.copy(), motion_mask, warmed_up
+            )
+            self._last_submit = now
+
+        # ── Annotation avec les dernières détections disponibles ───────
+        with self._det_lock:
+            detections = list(self._detections)
+
+        annotated = self._annotate(frame.copy(), detections, warmed_up)
+
+        # ── Encodage JPEG réduit pour le stream ───────────────────────
+        sh, sw = annotated.shape[:2]
+        if sw > _STREAM_MAX_W:
+            sf       = _STREAM_MAX_W / sw
+            stream_f = cv2.resize(
+                annotated, (_STREAM_MAX_W, int(sh * sf)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        else:
+            stream_f = annotated
+
+        _, buf = cv2.imencode(
+            ".jpg", stream_f, [cv2.IMWRITE_JPEG_QUALITY, _STREAM_JPEG_Q]
+        )
+        with self._frame_lock:
+            self._latest_frame = buf.tobytes()
 
     # ── Inférence YOLO (appelée par le dispatcher dans son thread) ────────────
 
@@ -490,15 +568,16 @@ class CameraProcessor:
                 else:
                     is_moving = pixel_ok
 
-            # Classification inflow / outflow
+            # Classification inflow / outflow via produit scalaire avec le vecteur d'inflo
             flag_in = flag_out = False
-            if is_moving and abs(dx) >= 8:
-                if (dx > 0) == self._inflow_is_right:
+            if is_moving:
+                dot = dx * self._inflow_vx + dy * self._inflow_vy
+                if dot >= 8:
                     flag_in = True
-                else:
+                elif dot <= -8:
                     flag_out = True
 
-            detections.append((x1, y1, x2, y2, conf, is_moving, flag_in, flag_out))
+            detections.append((x1, y1, x2, y2, conf, is_moving, flag_in, flag_out, tid))
 
         return detections
 
@@ -509,7 +588,7 @@ class CameraProcessor:
     ) -> np.ndarray:
         moving = inflow = outflow = total = 0
 
-        for (x1, y1, x2, y2, conf, is_moving, flag_in, flag_out) in detections:
+        for (x1, y1, x2, y2, conf, is_moving, flag_in, flag_out, *_) in detections:
             total += 1
             if is_moving:
                 moving += 1
@@ -547,10 +626,18 @@ class CameraProcessor:
 # API publique
 # ─────────────────────────────────────────────────────────────────────────────
 
-def start_processor(camera_id: str, folder: str, angle: float = 0.0) -> None:
+def start_processor(
+    camera_id: str,
+    folder: str,
+    angle: float = 0.0,
+    source_type: str = "file",
+    usb_index: int | None = None,
+) -> None:
     with _plock:
         if camera_id not in _processors:
-            _processors[camera_id] = CameraProcessor(camera_id, folder, angle)
+            _processors[camera_id] = CameraProcessor(
+                camera_id, folder, angle, source_type, usb_index
+            )
 
 
 def stop_processor(camera_id: str) -> None:
@@ -573,6 +660,7 @@ def get_total_detected(camera_id: str) -> int:
 
 
 def get_flow_counts(camera_id: str) -> dict[str, int]:
+    """Compteurs instantanés du dernier frame YOLO — pour l'affichage temps réel."""
     with _plock:
         proc = _processors.get(camera_id)
     if proc:
@@ -581,6 +669,17 @@ def get_flow_counts(camera_id: str) -> dict[str, int]:
             "inflow":  proc.inflow_count,
             "outflow": proc.outflow_count,
         }
+    return {"moving": 0, "inflow": 0, "outflow": 0}
+
+
+def consume_flow_counts(camera_id: str) -> dict[str, int]:
+    """Compteurs accumulés depuis le dernier appel (dédoublonnés par track_id).
+    Remet les totaux à zéro — à appeler uniquement depuis le worker de snapshot."""
+    with _plock:
+        proc = _processors.get(camera_id)
+    if proc:
+        inflow, outflow = proc.consume_flow_counts()
+        return {"moving": proc.person_count, "inflow": inflow, "outflow": outflow}
     return {"moving": 0, "inflow": 0, "outflow": 0}
 
 
@@ -608,6 +707,56 @@ def frame_generator(camera_id: str) -> Generator[bytes, None, None]:
             proc_ref.remove_viewer()
 
 
+def update_processor(
+    camera_id: str,
+    angle: float | None = None,
+    source_type: str | None = None,
+    usb_index: int | None = None,
+    folder: str | None = None,
+) -> None:
+    """Met à jour l'angle à chaud ou redémarre le processeur si la source change."""
+    with _plock:
+        proc = _processors.get(camera_id)
+    if proc is None:
+        return
+    source_changed = source_type is not None and (
+        source_type != proc.source_type
+        or (source_type == "usb" and usb_index != proc.usb_index)
+    )
+    if source_changed:
+        stop_processor(camera_id)
+        if folder is not None:
+            start_processor(
+                camera_id, folder,
+                angle if angle is not None else proc.angle,
+                source_type,
+                usb_index if source_type == "usb" else None,
+            )
+    elif angle is not None:
+        proc.angle      = angle
+        proc._inflow_vx = math.cos(math.radians(angle))
+        proc._inflow_vy = math.sin(math.radians(angle))
+
+
+def list_usb_cameras() -> list[dict]:
+    """Sonde les indices 0-4 et retourne les caméras USB connectées."""
+    if not _CV2_AVAILABLE:
+        return []
+    devices: list[dict] = []
+    for i in range(5):
+        cap = cv2.VideoCapture(i, _USB_BACKEND)
+        if cap.isOpened():
+            devices.append({"index": i, "label": f"Caméra {i}"})
+            cap.release()
+    return devices
+
+
 def start_all(cameras: list[dict]) -> None:
     for cam in cameras:
-        start_processor(cam["id"], cam["folder"], cam.get("angle", 0.0))
+        start_processor(
+            cam["id"],
+            cam["folder"],
+            cam.get("angle", 0.0),
+            cam.get("source_type", "file"),
+            cam.get("usb_index"),
+        )
